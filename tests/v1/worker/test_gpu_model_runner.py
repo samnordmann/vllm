@@ -670,8 +670,8 @@ def test_init_kv_cache_without_kv_sharing(default_vllm_config):
 
     runner.initialize_kv_cache(kv_cache_config)
 
-    layer_0_kv = vllm_ctx[layer_0].kv_cache[0]
-    layer_1_kv = vllm_ctx[layer_1].kv_cache[0]
+    layer_0_kv = vllm_ctx[layer_0].kv_cache
+    layer_1_kv = vllm_ctx[layer_1].kv_cache
     # check layer 1 kv cache does NOT share memory with layer 0
     assert id(layer_1_kv) != id(layer_0_kv)
 
@@ -740,8 +740,8 @@ def test_init_kv_cache_with_kv_sharing_valid(default_vllm_config):
     runner.initialize_kv_cache(kv_cache_config)
     kv_cache_config_after_init = runner.kv_cache_config
 
-    layer_0_kv = vllm_ctx[layer_0].kv_cache[0]
-    layer_1_kv = vllm_ctx[layer_1].kv_cache[0]
+    layer_0_kv = vllm_ctx[layer_0].kv_cache
+    layer_1_kv = vllm_ctx[layer_1].kv_cache
     # check layer 1 kv cache shares memory with layer 0
     assert id(layer_1_kv) == id(layer_0_kv)
 
@@ -864,9 +864,9 @@ def test_hybrid_attention_mamba_tensor_shapes():
     np.random.shuffle(ind)
     blocks0, blocks1 = ind[: (num_blocks // 2)], ind[(num_blocks // 2) :]
 
-    attn_shape = vllm_ctx[layer_0].kv_cache[0].shape
-    conv_shape = vllm_ctx[layer_2].kv_cache[0][0].shape
-    ssm_shape = vllm_ctx[layer_2].kv_cache[0][1].shape
+    attn_shape = vllm_ctx[layer_0].kv_cache.shape
+    conv_shape = vllm_ctx[layer_2].kv_cache[0].shape
+    ssm_shape = vllm_ctx[layer_2].kv_cache[1].shape
 
     # assert we are using FlashInfer
     assert attn_shape[0] % num_blocks == 0
@@ -905,21 +905,21 @@ def test_hybrid_attention_mamba_tensor_shapes():
     kernel_blocks_for_attention = kv_blocks_for_attention * block_split_ratio
 
     for layer in [layer_0, layer_1]:
-        # attention: kv_cache[0][kernel_block_idx, kv_idx, ...]
+        # attention: kv_cache[kernel_block_idx, kv_idx, ...]
         for i, kernel_block in enumerate(kernel_blocks_for_attention):
-            vllm_ctx[layer].kv_cache[0][kernel_block, :] = attn_blocks_constant[i]
+            vllm_ctx[layer].kv_cache[kernel_block, :] = attn_blocks_constant[i]
 
     # fill mamba blocks with constants using kernel block indices
     for layer in [layer_2, layer_3, layer_4, layer_5]:
-        # mamba: kv_cache[0][component][kernel_block_idx, ...]
+        # mamba: kv_cache[component][kernel_block_idx, ...]
         for i, kv_block in enumerate(kv_blocks_for_mamba):
-            vllm_ctx[layer].kv_cache[0][0][kv_block, :] = conv_blocks_constant[i]
-            vllm_ctx[layer].kv_cache[0][1][kv_block, :] = ssm_blocks_constant[i]
+            vllm_ctx[layer].kv_cache[0][kv_block, :] = conv_blocks_constant[i]
+            vllm_ctx[layer].kv_cache[1][kv_block, :] = ssm_blocks_constant[i]
 
     # verify attention and mamba contents are correct
     for layer in [layer_0, layer_1]:
         for i, kernel_block in enumerate(kernel_blocks_for_attention):
-            actual_kv = vllm_ctx[layer].kv_cache[0][kernel_block, :]
+            actual_kv = vllm_ctx[layer].kv_cache[kernel_block, :]
             expected = attn_blocks_constant[i]
 
             # Check K and V separately
@@ -928,8 +928,8 @@ def test_hybrid_attention_mamba_tensor_shapes():
 
     for layer in [layer_2, layer_3, layer_4, layer_5]:
         for i, kv_block in enumerate(kv_blocks_for_mamba):
-            actual_conv = vllm_ctx[layer].kv_cache[0][0][kv_block, :]
-            actual_ssm = vllm_ctx[layer].kv_cache[0][1][kv_block, :]
+            actual_conv = vllm_ctx[layer].kv_cache[0][kv_block, :]
+            actual_ssm = vllm_ctx[layer].kv_cache[1][kv_block, :]
             expected_conv = conv_blocks_constant[i]
             expected_ssm = ssm_blocks_constant[i]
 
@@ -938,8 +938,8 @@ def test_hybrid_attention_mamba_tensor_shapes():
 
     for layer in [layer_2, layer_3, layer_4, layer_5]:
         for i, kv_block in enumerate(kv_blocks_for_mamba):
-            actual_conv = vllm_ctx[layer].kv_cache[0][0][kv_block, :]
-            actual_ssm = vllm_ctx[layer].kv_cache[0][1][kv_block, :]
+            actual_conv = vllm_ctx[layer].kv_cache[0][kv_block, :]
+            actual_ssm = vllm_ctx[layer].kv_cache[1][kv_block, :]
             expected_conv = conv_blocks_constant[i]
             expected_ssm = ssm_blocks_constant[i]
             assert torch.equal(actual_conv, expected_conv)
@@ -1191,9 +1191,9 @@ def test_is_uniform_decode() -> None:
     current_platform.is_rocm(),
     reason="Attention backend FLASHINFER is not supported on ROCm.",
 )
-def test_cudagraph_sizes_capped_for_mamba_cache():
-    """Test that cudagraph capture sizes are capped to num_blocks for
-    hybrid models with Mamba layers.
+def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
+    """Test that a ValueError is raised when max_num_seqs exceeds the
+    available Mamba cache blocks for hybrid models with FULL cudagraphs.
 
     See: https://github.com/vllm-project/vllm/issues/34094
     """
@@ -1284,23 +1284,8 @@ def test_cudagraph_sizes_capped_for_mamba_cache():
         )[0]
         num_blocks = kv_cache_config.num_blocks
 
-        # Set max_cudagraph_capture_size to a value larger than num_blocks
-        # to trigger the Mamba capping logic.
-        large_max = num_blocks + 100
-        compilation_config = vllm_config.compilation_config
-        compilation_config.max_cudagraph_capture_size = large_max
-        compilation_config.cudagraph_capture_sizes = [
-            s for s in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512] if s <= large_max
-        ]
+        # Force max_num_seqs to exceed num_blocks so the check triggers.
+        runner.max_num_reqs = num_blocks + 100
 
-        runner.initialize_kv_cache(kv_cache_config)
-
-    # After initialization, cudagraph sizes should be capped
-    assert compilation_config.max_cudagraph_capture_size <= num_blocks
-    assert all(s <= num_blocks for s in compilation_config.cudagraph_capture_sizes)
-    # Invariant: last element == max
-    if compilation_config.cudagraph_capture_sizes:
-        assert (
-            compilation_config.cudagraph_capture_sizes[-1]
-            == compilation_config.max_cudagraph_capture_size
-        )
+        with pytest.raises(ValueError, match="max_num_seqs"):
+            runner.initialize_kv_cache(kv_cache_config)
