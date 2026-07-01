@@ -690,8 +690,15 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
                 moe_a2a_get_dispatch_payload_size(
                     self.world_size,
                     max_num_tokens,
-                    top_k * 8,
-                    1,
+                    top_k,
+                    4,
+                    MoeA2APayloadLayout.LINEAR,
+                ),
+                moe_a2a_get_dispatch_payload_size(
+                    self.world_size,
+                    max_num_tokens,
+                    top_k,
+                    4,
                     MoeA2APayloadLayout.LINEAR,
                 ),
             ]

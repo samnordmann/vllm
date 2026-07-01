@@ -13,6 +13,29 @@ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
 
+def _view_r128c4_scale_payload(
+    payload: torch.Tensor, logical_rows: int, columns: int
+) -> torch.Tensor:
+    """Expose a flat R128C4 buffer with the shape expected by MoE plumbing.
+
+    The physical row count is padded to 128. The expert kernel consumes only the
+    pointer and derives its logical row count from the activation tensor.
+    """
+    if columns <= 0 or columns % 4 != 0:
+        raise ValueError(
+            f"R128C4 scale columns must be positive and divisible by 4: {columns}"
+        )
+    padded_rows = (logical_rows + 127) // 128 * 128
+    expected_numel = padded_rows * columns
+    if payload.numel() != expected_numel:
+        raise ValueError(
+            "R128C4 scale payload size mismatch: "
+            f"got {payload.numel()}, expected {expected_numel} "
+            f"for {logical_rows=} and {columns=}"
+        )
+    return payload.view(padded_rows, columns)
+
+
 def get_local_sizes():
     dp_metadata = get_forward_context().dp_metadata
     assert dp_metadata is not None
@@ -43,6 +66,10 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         self.num_dispatchers_ = num_dispatchers
         self.scale_elems_per_token = dispatch_scale_bytes_per_token
         self.dispatch_scale_r128c4 = dispatch_scale_r128c4
+        if dispatch_scale_r128c4 and dispatch_scale_bytes_per_token % 4 != 0:
+            raise ValueError(
+                "direct R128C4 scale dispatch requires a multiple of 4 columns"
+            )
 
         device_communicator = get_ep_group().device_communicator
         assert device_communicator is not None
@@ -143,19 +170,22 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         )
         if a1q_scale is not None:
             a1q_recv, a1q_scale_recv, topk_ids_recv, topk_weights_recv = recv_payloads
-            # Apply scale interleaving only for CUTLASS (not TRT-LLM)
-            if (
-                quant_config.quant_dtype == "nvfp4"
-                and quant_config.is_scale_swizzled
-                and not self.dispatch_scale_r128c4
-            ):
-                a1q_scale_recv = a1q_scale_recv.view(-1, a1q_scale_recv.shape[-1])
-                a1q_scale_recv = a1q_scale_recv.view(torch.uint8)
-                a1q_scale_recv = nvfp4_block_scale_interleave(a1q_scale_recv)
-            elif self.dispatch_scale_r128c4:
-                a1q_scale_recv = a1q_scale_recv.view(torch.uint8)
             assert self.scale_elems_per_token > 0
-            a1q_scale_recv = a1q_scale_recv.view(-1, self.scale_elems_per_token)
+            if self.dispatch_scale_r128c4:
+                a1q_scale_recv = _view_r128c4_scale_payload(
+                    a1q_scale_recv.view(torch.uint8),
+                    self.num_dispatchers_ * self.runtime_max_tokens_per_rank,
+                    self.scale_elems_per_token,
+                )
+            else:
+                if (
+                    quant_config.quant_dtype == "nvfp4"
+                    and quant_config.is_scale_swizzled
+                ):
+                    a1q_scale_recv = a1q_scale_recv.view(-1, a1q_scale_recv.shape[-1])
+                    a1q_scale_recv = a1q_scale_recv.view(torch.uint8)
+                    a1q_scale_recv = nvfp4_block_scale_interleave(a1q_scale_recv)
+                a1q_scale_recv = a1q_scale_recv.view(-1, self.scale_elems_per_token)
         else:
             a1q_recv, topk_ids_recv, topk_weights_recv = recv_payloads
             a1q_scale_recv = None
