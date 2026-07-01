@@ -33,6 +33,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         num_dispatchers: int = 1,
         dispatch_dtype_bytes_per_elem: int = 0,
         dispatch_scale_bytes_per_token: int = 0,
+        dispatch_scale_r128c4: bool = False,
     ):
         super().__init__()
         self.max_num_tokens = max_num_tokens
@@ -41,6 +42,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         self.hidden_size = hidden_size
         self.num_dispatchers_ = num_dispatchers
         self.scale_elems_per_token = dispatch_scale_bytes_per_token
+        self.dispatch_scale_r128c4 = dispatch_scale_r128c4
 
         device_communicator = get_ep_group().device_communicator
         assert device_communicator is not None
@@ -54,6 +56,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             hidden_size=self.hidden_size,
             dispatch_dtype_bytes_per_elem=dispatch_dtype_bytes_per_elem,
             dispatch_scale_bytes_per_token=dispatch_scale_bytes_per_token,
+            dispatch_scale_r128c4=dispatch_scale_r128c4,
         )
 
     @property
@@ -118,6 +121,17 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
+        output_payload_layouts = None
+        if a1q_scale is not None and self.dispatch_scale_r128c4:
+            from flashinfer.comm.trtllm_moe_alltoall import MoeA2APayloadLayout
+
+            output_payload_layouts = [
+                MoeA2APayloadLayout.LINEAR,
+                MoeA2APayloadLayout.R128C4,
+                MoeA2APayloadLayout.LINEAR,
+                MoeA2APayloadLayout.LINEAR,
+            ]
+
         assert self.all2all_manager.moe_alltoall is not None  # type: ignore[attr-defined]
         recv_payloads = self.all2all_manager.moe_alltoall.dispatch(  # type: ignore[attr-defined]
             token_selected_experts=topk_ids,
@@ -125,14 +139,21 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
             invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
             expert_id_payload_index=topk_ids_payload_index,
+            output_payload_layouts=output_payload_layouts,
         )
         if a1q_scale is not None:
             a1q_recv, a1q_scale_recv, topk_ids_recv, topk_weights_recv = recv_payloads
             # Apply scale interleaving only for CUTLASS (not TRT-LLM)
-            if quant_config.quant_dtype == "nvfp4" and quant_config.is_scale_swizzled:
+            if (
+                quant_config.quant_dtype == "nvfp4"
+                and quant_config.is_scale_swizzled
+                and not self.dispatch_scale_r128c4
+            ):
                 a1q_scale_recv = a1q_scale_recv.view(-1, a1q_scale_recv.shape[-1])
                 a1q_scale_recv = a1q_scale_recv.view(torch.uint8)
                 a1q_scale_recv = nvfp4_block_scale_interleave(a1q_scale_recv)
+            elif self.dispatch_scale_r128c4:
+                a1q_scale_recv = a1q_scale_recv.view(torch.uint8)
             assert self.scale_elems_per_token > 0
             a1q_scale_recv = a1q_scale_recv.view(-1, self.scale_elems_per_token)
         else:

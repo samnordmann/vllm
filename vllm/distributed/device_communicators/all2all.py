@@ -31,7 +31,9 @@ if has_flashinfer_nvlink_one_sided():
     from flashinfer.comm import Mapping  # type: ignore[import-not-found]
     from flashinfer.comm.mnnvl import MnnvlConfig  # type: ignore[import-not-found]
     from flashinfer.comm.trtllm_moe_alltoall import (
+        MoeA2APayloadLayout,
         MoeAlltoAll,  # type: ignore[import-not-found]
+        moe_a2a_get_dispatch_payload_size,
         moe_a2a_get_workspace_size_per_rank,
     )
 
@@ -653,6 +655,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         hidden_size: int,
         dispatch_dtype_bytes_per_elem: int = 0,
         dispatch_scale_bytes_per_token: int = 0,
+        dispatch_scale_r128c4: bool = False,
     ):
         """Initialize (or grow) the MoeAlltoAll workspace."""
         if dispatch_dtype_bytes_per_elem == 0:
@@ -666,11 +669,38 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             + top_k * 4  # float32 topk weights
         )
         combine_payload_size_per_token = hidden_size * 2  # bf16 hidden states
+        dispatch_payload_sizes = None
+        if dispatch_scale_r128c4:
+            assert dispatch_scale_bytes_per_token > 0
+            dispatch_payload_sizes = [
+                moe_a2a_get_dispatch_payload_size(
+                    self.world_size,
+                    max_num_tokens,
+                    hidden_bytes,
+                    1,
+                    MoeA2APayloadLayout.LINEAR,
+                ),
+                moe_a2a_get_dispatch_payload_size(
+                    self.world_size,
+                    max_num_tokens,
+                    dispatch_scale_bytes_per_token,
+                    1,
+                    MoeA2APayloadLayout.R128C4,
+                ),
+                moe_a2a_get_dispatch_payload_size(
+                    self.world_size,
+                    max_num_tokens,
+                    top_k * 8,
+                    1,
+                    MoeA2APayloadLayout.LINEAR,
+                ),
+            ]
         needed_workspace_size = moe_a2a_get_workspace_size_per_rank(
             ep_size=self.world_size,
             max_num_tokens=max_num_tokens,
             total_dispatch_payload_size_per_token=total_dispatch_payload_size_per_token,
             combine_payload_size_per_token=combine_payload_size_per_token,
+            dispatch_payload_sizes=dispatch_payload_sizes,
         )
         # workspace_size and max_num_tokens are kernel-side max-bounds, so
         # heterogeneous MoE layers (e.g. NVFP4 base + bf16 MTP head) only

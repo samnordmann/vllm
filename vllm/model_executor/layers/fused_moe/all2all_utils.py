@@ -38,6 +38,25 @@ from vllm.utils.import_utils import (
 
 logger = init_logger(__name__)
 
+
+def _use_direct_nvfp4_scale_layout(
+    quant_dtype: torch.dtype | str | None,
+    is_scale_swizzled: bool,
+    hidden_size: int,
+    top_k: int,
+    num_experts: int,
+    ep_size: int,
+) -> bool:
+    return (
+        quant_dtype == "nvfp4"
+        and is_scale_swizzled
+        and hidden_size == 8192
+        and top_k == 22
+        and num_experts == 512
+        and ep_size == 4
+    )
+
+
 if current_platform.is_cuda_alike():
     if has_deep_ep():
         from .prepare_finalize.deepep_ht import DeepEPHTPrepareAndFinalize
@@ -313,6 +332,14 @@ def maybe_make_prepare_finalize(
             num_dispatchers=all2all_manager.world_size,
             dispatch_dtype_bytes_per_elem=dispatch_dtype_bytes_per_elem,
             dispatch_scale_bytes_per_token=dispatch_scale_bytes_per_token,
+            dispatch_scale_r128c4=_use_direct_nvfp4_scale_layout(
+                quant_config.quant_dtype,
+                quant_config.is_scale_swizzled,
+                moe.hidden_dim,
+                moe.experts_per_token,
+                moe.num_experts,
+                all2all_manager.world_size,
+            ),
         )
 
     elif moe.use_ag_rs_all2all_kernels and allow_new_interface:
