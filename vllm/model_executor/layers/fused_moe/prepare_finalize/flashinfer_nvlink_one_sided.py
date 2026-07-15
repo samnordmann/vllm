@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -17,6 +19,10 @@ def get_local_sizes():
     dp_metadata = get_forward_context().dp_metadata
     assert dp_metadata is not None
     return dp_metadata.get_chunk_sizes_across_dp_rank()
+
+
+def _experiment_enabled(name: str) -> bool:
+    return os.environ.get(name, "0") == "1"
 
 
 class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -41,6 +47,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         self.hidden_size = hidden_size
         self.num_dispatchers_ = num_dispatchers
         self.scale_elems_per_token = dispatch_scale_bytes_per_token
+        self.output_multiplier = 1.0
 
         device_communicator = get_ep_group().device_communicator
         assert device_communicator is not None
@@ -68,6 +75,42 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
 
     def output_is_reduced(self) -> bool:
         return True
+
+    def try_fuse_output_multiplier(self, multiplier: float) -> bool:
+        if not _experiment_enabled("VLLM_FLASHINFER_FUSED_OUTPUT_SCALE"):
+            return False
+        self.output_multiplier = multiplier
+        return True
+
+    def fused_expert_output_buffer(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        self._expert_output_in_workspace = False
+        if (
+            not _experiment_enabled("VLLM_FLASHINFER_DIRECT_COMBINE_WORKSPACE")
+            or self.runtime_max_tokens_per_rank < 4096
+        ):
+            return None
+
+        moe_alltoall = self.all2all_manager.moe_alltoall  # type: ignore[attr-defined]
+        assert moe_alltoall is not None
+        ep_size = self.all2all_manager.world_size
+        expected_shape = (ep_size * self.runtime_max_tokens_per_rank, shape[-1])
+        if shape != expected_shape:
+            return None
+
+        output = moe_alltoall.get_combine_payload_tensor_in_workspace(
+            runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
+            hidden_size=shape[-1],
+            dtype=dtype,
+        ).view(shape)
+        if output.device != device:
+            return None
+        self._expert_output_in_workspace = True
+        return output
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.int32
@@ -97,35 +140,51 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             else a1.shape[0]
         )
 
-        if defer_input_quant:
-            a1q, a1q_scale = a1, None
-        else:
-            a1q, a1q_scale = moe_kernel_quantize_input(
-                a1,
-                quant_config.a1_gscale,
-                quant_config.quant_dtype,
-                quant_config.per_act_token_quant,
-                quant_config.block_shape,
-                is_scale_swizzled=False,  # delay swizzle to after comm
-                mx_alignment=quant_config.mx_alignment,
-            )
-
-        payloads = []
-        payloads.append(a1q)
-        if a1q_scale is not None:
-            payloads.append(a1q_scale)
-        topk_ids_payload_index = len(payloads)
-        payloads.append(topk_ids)
-        payloads.append(topk_weights)
-
         assert self.all2all_manager.moe_alltoall is not None  # type: ignore[attr-defined]
-        recv_payloads = self.all2all_manager.moe_alltoall.dispatch(  # type: ignore[attr-defined]
-            token_selected_experts=topk_ids,
-            input_payloads=payloads,
-            runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
-            expert_id_payload_index=topk_ids_payload_index,
+        moe_alltoall = self.all2all_manager.moe_alltoall  # type: ignore[attr-defined]
+        fused_nvfp4_dispatch = (
+            not defer_input_quant
+            and quant_config.quant_dtype == "nvfp4"
+            and _experiment_enabled("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH")
         )
+        if fused_nvfp4_dispatch:
+            assert quant_config.a1_gscale is not None
+            recv_payloads = moe_alltoall.dispatch_nvfp4(
+                hidden_states=a1,
+                hidden_states_global_scale=quant_config.a1_gscale,
+                token_selected_experts=topk_ids,
+                passthrough_payloads=[topk_ids, topk_weights],
+                runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
+                invalid_token_expert_id=-1,
+                expert_id_passthrough_index=0,
+            )
+            a1q_scale = recv_payloads[1]
+        else:
+            if defer_input_quant:
+                a1q, a1q_scale = a1, None
+            else:
+                a1q, a1q_scale = moe_kernel_quantize_input(
+                    a1,
+                    quant_config.a1_gscale,
+                    quant_config.quant_dtype,
+                    quant_config.per_act_token_quant,
+                    quant_config.block_shape,
+                    is_scale_swizzled=False,  # delay swizzle to after comm
+                    mx_alignment=quant_config.mx_alignment,
+                )
+
+            payloads = [a1q]
+            if a1q_scale is not None:
+                payloads.append(a1q_scale)
+            topk_ids_payload_index = len(payloads)
+            payloads.extend((topk_ids, topk_weights))
+            recv_payloads = moe_alltoall.dispatch(
+                token_selected_experts=topk_ids,
+                input_payloads=payloads,
+                runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
+                invalid_token_expert_id=-1,
+                expert_id_payload_index=topk_ids_payload_index,
+            )
         if a1q_scale is not None:
             a1q_recv, a1q_scale_recv, topk_ids_recv, topk_weights_recv = recv_payloads
             # Apply scale interleaving only for CUTLASS (not TRT-LLM)
@@ -161,8 +220,13 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             ep_size, self.runtime_max_tokens_per_rank, hidden_size
         )
 
-        combined_output = self.all2all_manager.moe_alltoall.combine(  # type: ignore[attr-defined]
+        combine_kwargs: dict[str, float] = {}
+        if self.output_multiplier != 1.0:
+            combine_kwargs["output_multiplier"] = self.output_multiplier
+        self.all2all_manager.moe_alltoall.combine(  # type: ignore[attr-defined]
             payload=fused_expert_output,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
+            payload_in_workspace=getattr(self, "_expert_output_in_workspace", False),
+            output=output,
+            **combine_kwargs,
         )
-        output.copy_(combined_output)
