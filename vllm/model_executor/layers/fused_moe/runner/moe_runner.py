@@ -261,6 +261,7 @@ class MoERunner(MoERunnerInterface):
         self.routed_input_transform = routed_input_transform
         self.routed_output_transform = routed_output_transform
         self.routed_scaling_factor = routed_scaling_factor
+        self._routed_scale_fused = False
         self.gate = gate
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
@@ -399,7 +400,7 @@ class MoERunner(MoERunnerInterface):
         avoid overflow by dividing shared_output by the scale instead
         (the decoder layer compensates with matching divisions).
         """
-        if self.routed_scaling_factor != 1.0:
+        if self.routed_scaling_factor != 1.0 and not self._routed_scale_fused:
             if fused_output.dtype != torch.float16 or shared_output is None:
                 fused_output *= self.routed_scaling_factor
             elif shared_output is not None:
@@ -888,6 +889,17 @@ class MoERunner(MoERunnerInterface):
                     prepare_finalize,
                 )
             )
+            if (
+                self.routed_scaling_factor != 1.0
+                and self.moe_config.in_dtype != torch.float16
+            ):
+                moe_kernel = self._quant_method.moe_kernel
+                assert moe_kernel is not None
+                self._routed_scale_fused = (
+                    moe_kernel.prepare_finalize.try_fuse_output_multiplier(
+                        self.routed_scaling_factor
+                    )
+                )
 
     #
     # Properties

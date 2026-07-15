@@ -7,6 +7,9 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+    flashinfer_nvlink_one_sided as fi_one_sided,
+)
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -117,6 +120,15 @@ def test_external_output_buffer_is_passed_to_experts(monkeypatch):
     )
     assert fused_out is external_output
     assert impl.fused_experts.apply_kwargs["output"] is external_output
+
+
+def test_flashinfer_finalize_accepts_fused_output_multiplier():
+    prepare_finalize = object.__new__(
+        fi_one_sided.FlashInferNVLinkOneSidedPrepareAndFinalize
+    )
+
+    assert prepare_finalize.try_fuse_output_multiplier(5.0)
+    assert prepare_finalize.output_multiplier == 5.0
 
 
 @pytest.mark.parametrize("mismatch", ["shape", "dtype", "device", "contiguity"])

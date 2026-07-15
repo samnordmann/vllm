@@ -255,6 +255,10 @@ class FusedMoEPrepareAndFinalize(ABC):
         """Return an optional communication-owned expert output buffer."""
         return None
 
+    def try_fuse_output_multiplier(self, multiplier: float) -> bool:
+        """Configure a multiplier in finalize when the backend supports it."""
+        return False
+
     def on_commit(self) -> None:
         """
         Runs after this prepare/finalize has been committed to the active

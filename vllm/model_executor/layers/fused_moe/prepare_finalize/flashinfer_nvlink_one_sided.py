@@ -41,6 +41,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         self.hidden_size = hidden_size
         self.num_dispatchers_ = num_dispatchers
         self.scale_elems_per_token = dispatch_scale_bytes_per_token
+        self.output_multiplier = 1.0
 
         device_communicator = get_ep_group().device_communicator
         assert device_communicator is not None
@@ -67,6 +68,10 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         return self.num_dispatchers_
 
     def output_is_reduced(self) -> bool:
+        return True
+
+    def try_fuse_output_multiplier(self, multiplier: float) -> bool:
+        self.output_multiplier = multiplier
         return True
 
     def fused_expert_output_buffer(
@@ -206,5 +211,6 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             payload=fused_expert_output,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
             payload_in_workspace=getattr(self, "_expert_output_in_workspace", False),
+            output_multiplier=self.output_multiplier,
             output=output,
         )
