@@ -97,35 +97,49 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             else a1.shape[0]
         )
 
-        if defer_input_quant:
-            a1q, a1q_scale = a1, None
-        else:
-            a1q, a1q_scale = moe_kernel_quantize_input(
-                a1,
-                quant_config.a1_gscale,
-                quant_config.quant_dtype,
-                quant_config.per_act_token_quant,
-                quant_config.block_shape,
-                is_scale_swizzled=False,  # delay swizzle to after comm
-                mx_alignment=quant_config.mx_alignment,
-            )
-
-        payloads = []
-        payloads.append(a1q)
-        if a1q_scale is not None:
-            payloads.append(a1q_scale)
-        topk_ids_payload_index = len(payloads)
-        payloads.append(topk_ids)
-        payloads.append(topk_weights)
-
         assert self.all2all_manager.moe_alltoall is not None  # type: ignore[attr-defined]
-        recv_payloads = self.all2all_manager.moe_alltoall.dispatch(  # type: ignore[attr-defined]
-            token_selected_experts=topk_ids,
-            input_payloads=payloads,
-            runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
-            expert_id_payload_index=topk_ids_payload_index,
+        moe_alltoall = self.all2all_manager.moe_alltoall  # type: ignore[attr-defined]
+        fused_nvfp4_dispatch = (
+            not defer_input_quant and quant_config.quant_dtype == "nvfp4"
         )
+        if fused_nvfp4_dispatch:
+            assert quant_config.a1_gscale is not None
+            recv_payloads = moe_alltoall.dispatch_nvfp4(
+                hidden_states=a1,
+                hidden_states_global_scale=quant_config.a1_gscale,
+                token_selected_experts=topk_ids,
+                passthrough_payloads=[topk_ids, topk_weights],
+                runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
+                invalid_token_expert_id=-1,
+                expert_id_passthrough_index=0,
+            )
+            a1q_scale = recv_payloads[1]
+        else:
+            if defer_input_quant:
+                a1q, a1q_scale = a1, None
+            else:
+                a1q, a1q_scale = moe_kernel_quantize_input(
+                    a1,
+                    quant_config.a1_gscale,
+                    quant_config.quant_dtype,
+                    quant_config.per_act_token_quant,
+                    quant_config.block_shape,
+                    is_scale_swizzled=False,  # delay swizzle to after comm
+                    mx_alignment=quant_config.mx_alignment,
+                )
+
+            payloads = [a1q]
+            if a1q_scale is not None:
+                payloads.append(a1q_scale)
+            topk_ids_payload_index = len(payloads)
+            payloads.extend((topk_ids, topk_weights))
+            recv_payloads = moe_alltoall.dispatch(
+                token_selected_experts=topk_ids,
+                input_payloads=payloads,
+                runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
+                invalid_token_expert_id=-1,
+                expert_id_payload_index=topk_ids_payload_index,
+            )
         if a1q_scale is not None:
             a1q_recv, a1q_scale_recv, topk_ids_recv, topk_weights_recv = recv_payloads
             # Apply scale interleaving only for CUTLASS (not TRT-LLM)
