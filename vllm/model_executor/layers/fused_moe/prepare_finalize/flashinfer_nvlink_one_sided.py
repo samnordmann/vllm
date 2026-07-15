@@ -191,8 +191,6 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         self.all2all_manager.moe_alltoall.combine(  # type: ignore[attr-defined]
             payload=fused_expert_output,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
-            payload_in_workspace=getattr(
-                self, "_expert_output_in_workspace", False
-            ),
+            payload_in_workspace=getattr(self, "_expert_output_in_workspace", False),
             output=output,
         )
