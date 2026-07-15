@@ -165,6 +165,26 @@ def test_nvfp4_dispatch_global_scale_matches_scaled_fp4_quant():
     assert dispatch_scale.item() == expert_scales[0].item()
 
 
+@pytest.mark.parametrize(
+    ("ep_size", "tokens", "expected"),
+    [(4, 512, False), (8, 511, False), (8, 512, True), (8, 2048, True)],
+)
+def test_fused_nvfp4_dispatch_uses_measured_prefill_domain(
+    monkeypatch, ep_size, tokens, expected
+):
+    monkeypatch.setenv("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH", "1")
+    monkeypatch.setenv("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH_EP_SIZE", "8")
+    monkeypatch.setenv("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH_MIN_TOKENS", "512")
+
+    assert fi_one_sided._fused_nvfp4_dispatch_enabled(ep_size, tokens) is expected
+
+
+def test_fused_nvfp4_dispatch_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH", "0")
+
+    assert not fi_one_sided._fused_nvfp4_dispatch_enabled(8, 512)
+
+
 def test_flashinfer_direct_output_supports_small_runtime_capacity():
     class _FakeMoeAlltoall:
         def get_combine_payload_tensor_in_workspace(self, **kwargs):

@@ -25,6 +25,22 @@ def _experiment_enabled(name: str) -> bool:
     return os.environ.get(name, "1") == "1"
 
 
+def _fused_nvfp4_dispatch_enabled(
+    ep_size: int, runtime_max_tokens_per_rank: int
+) -> bool:
+    target_ep_size = int(
+        os.environ.get("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH_EP_SIZE", "8")
+    )
+    min_tokens = int(
+        os.environ.get("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH_MIN_TOKENS", "512")
+    )
+    return (
+        _experiment_enabled("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH")
+        and ep_size == target_ep_size
+        and runtime_max_tokens_per_rank >= min_tokens
+    )
+
+
 def _nvfp4_dispatch_global_scale(scale: torch.Tensor) -> torch.Tensor:
     assert scale.numel() > 0
     # Match scaled_fp4_quant, whose CUDA kernel consumes SFScale[0]. ModelOpt
@@ -149,7 +165,9 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         fused_nvfp4_dispatch = (
             not defer_input_quant
             and quant_config.quant_dtype == "nvfp4"
-            and _experiment_enabled("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH")
+            and _fused_nvfp4_dispatch_enabled(
+                ep_size, self.runtime_max_tokens_per_rank
+            )
         )
         if fused_nvfp4_dispatch:
             assert quant_config.a1_gscale is not None
