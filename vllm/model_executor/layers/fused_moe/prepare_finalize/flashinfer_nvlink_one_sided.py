@@ -69,6 +69,33 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
     def output_is_reduced(self) -> bool:
         return True
 
+    def fused_expert_output_buffer(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        self._expert_output_in_workspace = False
+        if self.runtime_max_tokens_per_rank < 4096:
+            return None
+
+        moe_alltoall = self.all2all_manager.moe_alltoall  # type: ignore[attr-defined]
+        assert moe_alltoall is not None
+        ep_size = self.all2all_manager.world_size
+        expected_shape = (ep_size * self.runtime_max_tokens_per_rank, shape[-1])
+        if shape != expected_shape:
+            return None
+
+        output = moe_alltoall.get_combine_payload_tensor_in_workspace(
+            runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
+            hidden_size=shape[-1],
+            dtype=dtype,
+        ).view(shape)
+        if output.device != device:
+            return None
+        self._expert_output_in_workspace = True
+        return output
+
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.int32
 
@@ -164,5 +191,8 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         self.all2all_manager.moe_alltoall.combine(  # type: ignore[attr-defined]
             payload=fused_expert_output,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
+            payload_in_workspace=getattr(
+                self, "_expert_output_in_workspace", False
+            ),
             output=output,
         )
