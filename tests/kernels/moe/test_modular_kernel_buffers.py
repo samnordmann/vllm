@@ -42,6 +42,11 @@ class _FakeExperts:
         self.apply_kwargs = kwargs
 
 
+class _ZeroWorkspaceExperts(_FakeExperts):
+    def workspace_shapes(self, M, *args):
+        return (0,), (0,), (M, 4)
+
+
 class _DefaultPrepareFinalize:
     fused_expert_output_buffer = (
         mk.FusedMoEPrepareAndFinalize.fused_expert_output_buffer
@@ -120,6 +125,26 @@ def test_external_output_buffer_is_passed_to_experts(monkeypatch):
     )
     assert fused_out is external_output
     assert impl.fused_experts.apply_kwargs["output"] is external_output
+
+
+def test_external_output_buffer_handles_zero_sized_expert_workspaces(monkeypatch):
+    workspace_manager = _FakeWorkspaceManager()
+    monkeypatch.setattr(mk, "current_workspace_manager", lambda: workspace_manager)
+    external_output = torch.empty((5, 4), dtype=torch.bfloat16)
+    impl = _make_impl(
+        SimpleNamespace(fused_expert_output_buffer=lambda *args: external_output)
+    )
+    impl.fused_experts = _ZeroWorkspaceExperts()
+
+    workspace13, workspace2, fused_out = _allocate(impl)
+
+    assert workspace_manager.requests == (
+        ((1,), torch.bfloat16),
+        ((0,), torch.bfloat16),
+    )
+    assert workspace13.numel() == 0
+    assert workspace2.numel() == 0
+    assert fused_out is external_output
 
 
 def test_flashinfer_finalize_accepts_fused_output_multiplier():

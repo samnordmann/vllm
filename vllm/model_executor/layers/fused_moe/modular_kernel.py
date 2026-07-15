@@ -1107,7 +1107,9 @@ class FusedMoEKernelModularImpl:
 
         # Cache1 and cache3 can share storage unless finalize requires its own
         # communication-visible output buffer.
-        max_shape_size = prod(workspace13_shape)
+        # An external output can leave both expert scratch buffers empty for a
+        # valid profile shape. Keep the shared workspace allocation non-empty.
+        max_shape_size = max(1, prod(workspace13_shape))
         if external_fused_out is None:
             max_shape_size = max(max_shape_size, prod(fused_out_shape))
         common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
