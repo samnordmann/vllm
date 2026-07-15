@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -17,6 +19,10 @@ def get_local_sizes():
     dp_metadata = get_forward_context().dp_metadata
     assert dp_metadata is not None
     return dp_metadata.get_chunk_sizes_across_dp_rank()
+
+
+def _experiment_enabled(name: str) -> bool:
+    return os.environ.get(name, "1") == "1"
 
 
 class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -71,6 +77,8 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         return True
 
     def try_fuse_output_multiplier(self, multiplier: float) -> bool:
+        if not _experiment_enabled("VLLM_FLASHINFER_FUSED_OUTPUT_SCALE"):
+            return False
         self.output_multiplier = multiplier
         return True
 
@@ -81,7 +89,10 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         device: torch.device,
     ) -> torch.Tensor | None:
         self._expert_output_in_workspace = False
-        if self.runtime_max_tokens_per_rank < 4096:
+        if (
+            not _experiment_enabled("VLLM_FLASHINFER_DIRECT_COMBINE_WORKSPACE")
+            or self.runtime_max_tokens_per_rank < 4096
+        ):
             return None
 
         moe_alltoall = self.all2all_manager.moe_alltoall  # type: ignore[attr-defined]
@@ -132,7 +143,9 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         assert self.all2all_manager.moe_alltoall is not None  # type: ignore[attr-defined]
         moe_alltoall = self.all2all_manager.moe_alltoall  # type: ignore[attr-defined]
         fused_nvfp4_dispatch = (
-            not defer_input_quant and quant_config.quant_dtype == "nvfp4"
+            not defer_input_quant
+            and quant_config.quant_dtype == "nvfp4"
+            and _experiment_enabled("VLLM_FLASHINFER_FUSED_NVFP4_DISPATCH")
         )
         if fused_nvfp4_dispatch:
             assert quant_config.a1_gscale is not None
@@ -207,10 +220,13 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             ep_size, self.runtime_max_tokens_per_rank, hidden_size
         )
 
+        combine_kwargs: dict[str, float] = {}
+        if self.output_multiplier != 1.0:
+            combine_kwargs["output_multiplier"] = self.output_multiplier
         self.all2all_manager.moe_alltoall.combine(  # type: ignore[attr-defined]
             payload=fused_expert_output,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
             payload_in_workspace=getattr(self, "_expert_output_in_workspace", False),
-            output_multiplier=self.output_multiplier,
             output=output,
+            **combine_kwargs,
         )
