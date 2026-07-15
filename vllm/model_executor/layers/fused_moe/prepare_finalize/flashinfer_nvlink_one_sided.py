@@ -96,10 +96,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         device: torch.device,
     ) -> torch.Tensor | None:
         self._expert_output_in_workspace = False
-        if (
-            not _experiment_enabled("VLLM_FLASHINFER_DIRECT_COMBINE_WORKSPACE")
-            or self.runtime_max_tokens_per_rank < 4096
-        ):
+        if not _experiment_enabled("VLLM_FLASHINFER_DIRECT_COMBINE_WORKSPACE"):
             return None
 
         moe_alltoall = self.all2all_manager.moe_alltoall  # type: ignore[attr-defined]

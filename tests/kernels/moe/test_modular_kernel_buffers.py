@@ -165,6 +165,31 @@ def test_nvfp4_dispatch_global_scale_matches_scaled_fp4_quant():
     assert dispatch_scale.item() == expert_scales[0].item()
 
 
+def test_flashinfer_direct_output_supports_small_runtime_capacity():
+    class _FakeMoeAlltoall:
+        def get_combine_payload_tensor_in_workspace(self, **kwargs):
+            return torch.empty(
+                (4, kwargs["runtime_max_tokens_per_rank"], kwargs["hidden_size"]),
+                dtype=kwargs["dtype"],
+            )
+
+    prepare_finalize = object.__new__(
+        fi_one_sided.FlashInferNVLinkOneSidedPrepareAndFinalize
+    )
+    prepare_finalize.runtime_max_tokens_per_rank = 4
+    prepare_finalize.all2all_manager = SimpleNamespace(
+        moe_alltoall=_FakeMoeAlltoall(), world_size=4
+    )
+
+    output = prepare_finalize.fused_expert_output_buffer(
+        (16, 2048), torch.bfloat16, torch.device("cpu")
+    )
+
+    assert output is not None
+    assert output.shape == (16, 2048)
+    assert prepare_finalize._expert_output_in_workspace
+
+
 @pytest.mark.parametrize("mismatch", ["shape", "dtype", "device", "contiguity"])
 def test_invalid_external_output_buffer_is_rejected(monkeypatch, mismatch):
     workspace_manager = _FakeWorkspaceManager()
