@@ -162,6 +162,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
 
         assert self.all2all_manager.moe_alltoall is not None  # type: ignore[attr-defined]
         moe_alltoall = self.all2all_manager.moe_alltoall  # type: ignore[attr-defined]
+        ep_size = self.all2all_manager.world_size
         fused_nvfp4_dispatch = (
             not defer_input_quant
             and quant_config.quant_dtype == "nvfp4"
