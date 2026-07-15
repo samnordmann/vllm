@@ -25,6 +25,13 @@ def _experiment_enabled(name: str) -> bool:
     return os.environ.get(name, "1") == "1"
 
 
+def _nvfp4_dispatch_global_scale(scale: torch.Tensor) -> torch.Tensor:
+    assert scale.numel() > 0
+    # Match scaled_fp4_quant, whose CUDA kernel consumes SFScale[0]. ModelOpt
+    # may expose the same activation scale once per local expert.
+    return scale.reshape(-1)[:1]
+
+
 class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """FlashInfer implementation using the Moe AlltoAll kernel."""
 
@@ -151,7 +158,9 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             assert quant_config.a1_gscale is not None
             recv_payloads = moe_alltoall.dispatch_nvfp4(
                 hidden_states=a1,
-                hidden_states_global_scale=quant_config.a1_gscale,
+                hidden_states_global_scale=_nvfp4_dispatch_global_scale(
+                    quant_config.a1_gscale
+                ),
                 token_selected_experts=topk_ids,
                 passthrough_payloads=[topk_ids, topk_weights],
                 runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,

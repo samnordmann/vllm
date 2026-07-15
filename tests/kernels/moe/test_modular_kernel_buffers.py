@@ -131,6 +131,15 @@ def test_flashinfer_finalize_accepts_fused_output_multiplier():
     assert prepare_finalize.output_multiplier == 5.0
 
 
+def test_nvfp4_dispatch_global_scale_matches_scaled_fp4_quant():
+    expert_scales = torch.tensor([0.125, 0.125, 0.125])
+
+    dispatch_scale = fi_one_sided._nvfp4_dispatch_global_scale(expert_scales)
+
+    assert dispatch_scale.shape == (1,)
+    assert dispatch_scale.item() == expert_scales[0].item()
+
+
 @pytest.mark.parametrize("mismatch", ["shape", "dtype", "device", "contiguity"])
 def test_invalid_external_output_buffer_is_rejected(monkeypatch, mismatch):
     workspace_manager = _FakeWorkspaceManager()
