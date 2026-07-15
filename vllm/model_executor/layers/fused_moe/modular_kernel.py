@@ -246,6 +246,15 @@ class FusedMoEPrepareAndFinalize(ABC):
         """
         return False
 
+    def fused_expert_output_buffer(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Return an optional communication-owned expert output buffer."""
+        return None
+
     def on_commit(self) -> None:
         """
         Runs after this prepare/finalize has been committed to the active
@@ -1098,16 +1107,28 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        # We can reuse the memory between cache1 and cache3 because by the
-        # time we need cache3, we're done with cache1.
-        # Reuse workspace13 for the output since there is only one chunk.
-        max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+        external_fused_out = self.prepare_finalize.fused_expert_output_buffer(
+            fused_out_shape, workspace_dtype, device
+        )
+
+        # Cache1 and cache3 can share storage unless finalize requires its own
+        # communication-visible output buffer.
+        max_shape_size = prod(workspace13_shape)
+        if external_fused_out is None:
+            max_shape_size = max(max_shape_size, prod(fused_out_shape))
         common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
             ((max_shape_size,), workspace_dtype),
             (workspace2_shape, workspace_dtype),
         )
         workspace13 = _resize_cache(common_workspace, workspace13_shape)
-        fused_out = _resize_cache(common_workspace, fused_out_shape)
+        if external_fused_out is None:
+            fused_out = _resize_cache(common_workspace, fused_out_shape)
+        else:
+            assert external_fused_out.shape == fused_out_shape
+            assert external_fused_out.dtype == workspace_dtype
+            assert external_fused_out.device == device
+            assert external_fused_out.is_contiguous()
+            fused_out = external_fused_out
 
         return workspace13, workspace2, fused_out
 
