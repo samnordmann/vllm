@@ -181,10 +181,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
+        rs_sizes = None if sizes.count(sizes[0]) == len(sizes) else sizes
         return dist_group.reduce_scatterv(
             hidden_states,
             dim=0,
-            sizes=sizes,
+            sizes=rs_sizes,
             output=output,
             use_symmetric_memory=False,
         )
