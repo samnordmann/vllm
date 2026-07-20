@@ -657,24 +657,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """AllGather a list of tensors using NCCL symmetric memory (NVLS).
 
         Uses group_start/group_end to batch the collectives.
-        Only the output needs to be in symmetric memory (see
-        _all_gather_symm_mem).
+        Only the outputs need to be in symmetric memory. Reuse registered
+        receive buffers so the hot path neither allocates nor registers memory.
         """
-        from vllm.distributed.device_communicators.pynccl_allocator import (
-            nccl_symm_mem_context,
-        )
-
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
         world_size = self.world_size
 
         symm_outputs = []
-        with nccl_symm_mem_context(pynccl_comm):
-            for inp in inputs:
-                out_size = (inp.size(0) * world_size,) + inp.size()[1:]
-                symm_outputs.append(
-                    torch.empty(out_size, dtype=inp.dtype, device=inp.device)
+        for index, inp in enumerate(inputs):
+            out_size = (inp.size(0) * world_size,) + inp.size()[1:]
+            symm_outputs.append(
+                self._get_symm_scratch(
+                    f"batched_ag_out_{index}", out_size, inp.dtype, inp.device
                 )
+            )
 
         pynccl_comm.group_start()
         for symm_out, inp in zip(symm_outputs, inputs):
