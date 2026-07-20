@@ -391,7 +391,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        if should_nccl_symm_mem_ag_rs():
+        if should_nccl_symm_mem_ag_rs() and is_symmetric_memory_tensor(input_tensor):
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
             output = torch.empty(
@@ -471,7 +471,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_symmetric_memory = should_nccl_symm_mem_ag_rs() and (
                 is_symmetric_memory_tensor(input_tensor)
             )
-        use_symm_mem = sizes is None and use_symmetric_memory
+        use_symm_mem = (
+            sizes is None
+            and use_symmetric_memory
+            and is_symmetric_memory_tensor(input_tensor)
+        )
         if use_symm_mem:
             output = self._reduce_scatter_symm_mem(input_tensor, output)
         else:
@@ -503,9 +507,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         Safe for serial (eager) sequence parallelism: each collective's result
         is consumed on the same stream before the next same-role collective
-        reuses the buffer. Distinct roles (e.g. ``rs_in`` vs ``ag_out``, both
-        full-size) get distinct buffers so a reduce-scatter input copy never
-        clobbers a still-live all-gather output.
+        reuses the buffer. Distinct payload roles get distinct buffers so one
+        result cannot clobber another still-live result.
         """
         from vllm.distributed.device_communicators.pynccl_allocator import (
             nccl_symm_mem_context,
@@ -529,16 +532,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ) -> torch.Tensor:
         """ReduceScatter using NCCL symmetric memory (NVLS).
 
-        Only called for uniform-size reduce_scatter (variable sizes are
-        guarded out by the caller to avoid asymmetric ncclCommWindowRegister).
-        Uses persistent pre-registered scratch (see _get_symm_scratch).
+        Only called for uniform-size reduce_scatter with an already-registered
+        input (variable sizes are guarded out by the caller to avoid asymmetric
+        ncclCommWindowRegister). The output may be ordinary memory.
         """
-        from vllm.distributed.device_communicators.pynccl_allocator import (
-            is_symmetric_memory_tensor,
-        )
 
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
+        assert is_symmetric_memory_tensor(input_tensor)
 
         chunk = input_tensor.shape[0] // self.world_size
         output_shape = (chunk,) + tuple(input_tensor.shape[1:])
@@ -547,19 +548,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             output = self._get_symm_scratch(
                 "rs_out", output_shape, input_tensor.dtype, input_tensor.device
             )
-        # NVLS reduce-scatter (LDMC) requires the input in symmetric memory.
-        if is_symmetric_memory_tensor(input_tensor):
-            symm_input = input_tensor
-        else:
-            symm_input = self._get_symm_scratch(
-                "rs_in",
-                tuple(input_tensor.shape),
-                input_tensor.dtype,
-                input_tensor.device,
-            )
-            symm_input.copy_(input_tensor)
-
-        pynccl_comm.reduce_scatter(output, symm_input)
+        pynccl_comm.reduce_scatter(output, input_tensor)
         return output
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
