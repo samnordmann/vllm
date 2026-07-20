@@ -417,6 +417,32 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Convert negative dim to positive.
             dim += input_.dim()
 
+        # The MoE combine path already provides contiguous dim-0 input and
+        # output buffers and explicitly selects ordinary NCCL. Avoid creating
+        # views and re-normalizing this hot path before launching the
+        # collective. This also handles uneven DP token counts through the
+        # reduce_scatterv fallback.
+        if output is not None and dim == 0 and use_symmetric_memory is False:
+            assert input_.is_contiguous()
+            if sizes is not None:
+                assert len(sizes) == world_size, f"{len(sizes)} == {world_size}"
+                assert input_.shape[0] == sum(sizes)
+                chunk_size = sizes[self.rank_in_group]
+            else:
+                assert input_.shape[0] % world_size == 0
+                chunk_size = input_.shape[0] // world_size
+            output_shape = (chunk_size,) + input_.shape[1:]
+            assert output.shape == output_shape
+            assert output.dtype == input_.dtype
+            assert output.device == input_.device
+            assert output.is_contiguous()
+
+            if sizes is not None and sizes.count(sizes[0]) != len(sizes):
+                pynccl_comm.reduce_scatterv(output, input_, sizes=sizes)
+            else:
+                pynccl_comm.reduce_scatter(output, input_)
+            return output
+
         # Note: This will produce an incorrect answer if we don't make
         # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
         input_tensor = input_.movedim(0, dim).contiguous()
