@@ -377,7 +377,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return output.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
-        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+        output: torch.Tensor | None = None,
     ):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -398,18 +402,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert input_tensor.shape[0] % world_size == 0
             chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
+        if output is not None:
+            assert dim == 0, "preallocated reduce-scatter output requires dim=0"
+            assert output.shape == output_shape
+            assert output.dtype == input_tensor.dtype
+            assert output.device == input_tensor.device
+            assert output.is_contiguous()
 
         # Symmetric memory is only used when all ranks have uniform sizes.
         # ncclCommWindowRegister is collective: asymmetric pool allocations
         # from variable per-rank sizes cause deadlocks.
+        if sizes is not None and sizes.count(sizes[0]) == len(sizes):
+            sizes = None
         use_symm_mem = sizes is None and should_nccl_symm_mem_ag_rs()
         if use_symm_mem:
-            output = self._reduce_scatter_symm_mem(input_tensor)
+            output = self._reduce_scatter_symm_mem(input_tensor, output)
         else:
-            output = torch.empty(
-                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-            )
-            if sizes is not None and sizes.count(sizes[0]) != len(sizes):
+            if output is None:
+                output = torch.empty(
+                    output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+                )
+            if sizes is not None:
                 pynccl_comm.reduce_scatterv(output, input_tensor, sizes=sizes)
             else:
                 pynccl_comm.reduce_scatter(output, input_tensor)
@@ -455,6 +468,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def _reduce_scatter_symm_mem(
         self,
         input_tensor: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """ReduceScatter using NCCL symmetric memory (NVLS).
 
@@ -472,9 +486,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         chunk = input_tensor.shape[0] // self.world_size
         output_shape = (chunk,) + tuple(input_tensor.shape[1:])
 
-        symm_output = self._get_symm_scratch(
-            "rs_out", output_shape, input_tensor.dtype, input_tensor.device
-        )
+        if output is None:
+            output = self._get_symm_scratch(
+                "rs_out", output_shape, input_tensor.dtype, input_tensor.device
+            )
         # NVLS reduce-scatter (LDMC) requires the input in symmetric memory.
         if is_symmetric_memory_tensor(input_tensor):
             symm_input = input_tensor
@@ -487,8 +502,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             symm_input.copy_(input_tensor)
 
-        pynccl_comm.reduce_scatter(symm_output, symm_input)
-        return symm_output
+        pynccl_comm.reduce_scatter(output, symm_input)
+        return output
+
+    def get_symmetric_memory_buffer(
+        self,
+        role: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        pynccl_comm = self.pynccl_comm
+        if (
+            pynccl_comm is None
+            or pynccl_comm.nccl_version < 23004
+            or not should_nccl_symm_mem_ag_rs()
+        ):
+            return None
+        return self._get_symm_scratch(role, shape, dtype, device)
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
@@ -710,6 +741,29 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return self.all2all_manager.combine(
             hidden_states,
             is_sequence_parallel,
+        )
+
+    def allocate_combine_input(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        is_sequence_parallel: bool = False,
+    ) -> torch.Tensor | None:
+        assert self.all2all_manager is not None
+        return self.all2all_manager.allocate_combine_input(
+            shape, dtype, device, is_sequence_parallel
+        )
+
+    def combine_into_output(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        is_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        assert self.all2all_manager is not None
+        return self.all2all_manager.combine_into_output(
+            hidden_states, output, is_sequence_parallel
         )
 
     def batch_isend_irecv(self, p2p_ops: list):

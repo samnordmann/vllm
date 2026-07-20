@@ -196,16 +196,25 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
             weight_and_reduce_impl = TopKWeightAndReduceContiguous()
 
+        ep_group = get_ep_group()
+        combine_input = ep_group.allocate_combine_input(
+            (topk_ids.shape[0], fused_expert_output.shape[-1]),
+            fused_expert_output.dtype,
+            fused_expert_output.device,
+            is_sequence_parallel=self.is_sequence_parallel,
+        )
         out = weight_and_reduce_impl.apply(
-            output=None,
+            output=combine_input,
             fused_expert_output=fused_expert_output,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        output.copy_(
-            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+        ep_group.combine_into_output(
+            out,
+            output,
+            is_sequence_parallel=self.is_sequence_parallel,
         )
 
 
