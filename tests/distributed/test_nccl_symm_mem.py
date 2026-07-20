@@ -165,7 +165,7 @@ def nccl_symm_mem_allgather_worker(local_rank: int, world_size: int):
         for index, input_ in enumerate(inputs):
             input_.fill_(local_rank + 11 + index)
         graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         for index, output in enumerate(outputs):
             expected = torch.cat(
@@ -270,6 +270,7 @@ def nccl_symm_mem_reduce_scatter_worker(local_rank: int, world_size: int):
 
         dist.barrier(group=get_tp_group().cpu_group)
         graph = torch.cuda.CUDAGraph()
+        ordinary_graph_output = torch.empty_like(ordinary_expected)
         with torch.cuda.graph(graph):
             graph_result = cuda_communicator.reduce_scatterv(
                 input_tensor,
@@ -277,14 +278,28 @@ def nccl_symm_mem_reduce_scatter_worker(local_rank: int, world_size: int):
                 sizes=[per_rank_size] * world_size,
                 output=output,
             )
+            ordinary_graph_result = cuda_communicator.reduce_scatterv(
+                ordinary_input,
+                dim=0,
+                sizes=[per_rank_size] * world_size,
+                output=ordinary_graph_output,
+                use_symmetric_memory=False,
+            )
         assert graph_result.data_ptr() == output.data_ptr()
+        assert ordinary_graph_result.data_ptr() == ordinary_graph_output.data_ptr()
 
         input_tensor.random_(24, 47)
         input_clone.copy_(input_tensor)
         dist.reduce_scatter_tensor(expected, input_clone, group=group)
+        ordinary_input.random_(48, 71)
+        ordinary_clone.copy_(ordinary_input)
+        dist.reduce_scatter_tensor(ordinary_expected, ordinary_clone, group=group)
         graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         torch.testing.assert_close(output, expected, atol=2.5, rtol=0.1)
+        torch.testing.assert_close(
+            ordinary_graph_output, ordinary_expected, atol=2.5, rtol=0.1
+        )
 
 
 @pytest.mark.skipif(
