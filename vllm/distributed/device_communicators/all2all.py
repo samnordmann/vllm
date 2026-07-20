@@ -156,6 +156,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
         is_sequence_parallel: bool = False,
     ) -> torch.Tensor | None:
         dist_group = self._get_comm_group(is_sequence_parallel)
+        sizes = self._get_sizes(shape[0] // dist_group.world_size, dist_group)
+        if sizes.count(sizes[0]) != len(sizes):
+            return None
         device_communicator = dist_group.device_communicator
         if device_communicator is None:
             return None
