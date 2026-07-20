@@ -148,6 +148,36 @@ class AgRsAll2AllManager(All2AllManagerBase):
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
         return hidden_states
 
+    def allocate_combine_input(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        is_sequence_parallel: bool = False,
+    ) -> torch.Tensor | None:
+        dist_group = self._get_comm_group(is_sequence_parallel)
+        device_communicator = dist_group.device_communicator
+        if device_communicator is None:
+            return None
+        return device_communicator.get_symmetric_memory_buffer(
+            "moe_agrs_combine", shape, dtype, device
+        )
+
+    def combine_into_output(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        is_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        dist_group = self._get_comm_group(is_sequence_parallel)
+        sizes = self._get_sizes(
+            hidden_states.shape[0] // dist_group.world_size,
+            dist_group,
+        )
+        return dist_group.reduce_scatterv(
+            hidden_states, dim=0, sizes=sizes, output=output
+        )
+
     def destroy(self):
         pass
 

@@ -567,7 +567,17 @@ def _args_dispatch_combine_worker(rank, world_size):
                 .contiguous()
             )
 
-            combined = manager.combine(expert_out, is_sequence_parallel=True)
+            combine_output = torch.empty(
+                (tokens_per_rank, hidden_size),
+                device=device,
+                dtype=expert_out.dtype,
+            )
+            combined = manager.combine_into_output(
+                expert_out,
+                combine_output,
+                is_sequence_parallel=True,
+            )
+            assert combined.data_ptr() == combine_output.data_ptr()
             assert combined.shape == (tokens_per_rank, hidden_size)
 
             for i in range(tokens_per_rank):
