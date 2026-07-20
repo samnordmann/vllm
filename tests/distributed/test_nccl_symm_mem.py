@@ -17,6 +17,7 @@ from vllm.distributed.device_communicators.pynccl import register_nccl_symmetric
 from vllm.distributed.device_communicators.pynccl_allocator import (
     get_nccl_mem_pool,
     is_symmetric_memory_enabled,
+    is_symmetric_memory_tensor,
 )
 from vllm.distributed.parallel_state import (
     get_tp_group,
@@ -130,15 +131,39 @@ def nccl_symm_mem_allgather_worker(local_rank: int, world_size: int):
             pytest.skip("NCCL symmetric memory is disabled.")
 
         per_rank_size = test_size_elements // world_size
-        input_tensor = torch.randint(
-            1, 23, (per_rank_size,), dtype=dtype, device=device
-        )
-        output = cuda_communicator.all_gatherv(input_tensor, dim=0)
+        inputs = [
+            torch.full((per_rank_size,), local_rank + 1, dtype=dtype, device=device),
+            torch.full(
+                (per_rank_size // 16,), local_rank + 7, dtype=torch.int32, device=device
+            ),
+        ]
+        assert all(not is_symmetric_memory_tensor(input_) for input_ in inputs)
 
-        group = get_tp_group().device_group
-        expected = torch.empty(test_size_elements, dtype=dtype, device=device)
-        dist.all_gather_into_tensor(expected, input_tensor, group=group)
-        torch.testing.assert_close(output, expected, atol=0.0, rtol=0.0)
+        outputs = cuda_communicator.all_gatherv(inputs, dim=0)
+        output_ptrs = [output.data_ptr() for output in outputs]
+        assert all(is_symmetric_memory_tensor(output) for output in outputs)
+        assert [
+            output.data_ptr() for output in cuda_communicator.all_gatherv(inputs)
+        ] == (output_ptrs)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_outputs = cuda_communicator.all_gatherv(inputs, dim=0)
+        assert [output.data_ptr() for output in graph_outputs] == output_ptrs
+
+        for index, input_ in enumerate(inputs):
+            input_.fill_(local_rank + 11 + index)
+        graph.replay()
+        torch.accelerator.synchronize()
+
+        for index, output in enumerate(outputs):
+            expected = torch.cat(
+                [
+                    torch.full_like(inputs[index], rank + 11 + index)
+                    for rank in range(world_size)
+                ]
+            )
+            torch.testing.assert_close(output, expected, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.skipif(
