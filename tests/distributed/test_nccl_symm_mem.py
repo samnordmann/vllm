@@ -132,6 +132,16 @@ def nccl_symm_mem_allgather_worker(local_rank: int, world_size: int):
             pytest.skip("NCCL symmetric memory is disabled.")
 
         per_rank_size = test_size_elements // world_size
+        single_input = torch.randint(
+            1, 23, (per_rank_size,), dtype=dtype, device=device
+        )
+        single_output = cuda_communicator.all_gatherv(single_input, dim=0)
+        single_expected = torch.empty(test_size_elements, dtype=dtype, device=device)
+        dist.all_gather_into_tensor(
+            single_expected, single_input, group=get_tp_group().device_group
+        )
+        torch.testing.assert_close(single_output, single_expected, atol=0.0, rtol=0.0)
+
         inputs = [
             torch.full((per_rank_size,), local_rank + 1, dtype=dtype, device=device),
             torch.full(
@@ -221,8 +231,22 @@ def nccl_symm_mem_reduce_scatter_worker(local_rank: int, world_size: int):
         per_rank_size = test_size_elements // world_size
         pynccl_comm = cuda_communicator.pynccl_comm
         assert pynccl_comm is not None
+
+        ordinary_input = torch.randint(
+            1, 23, (test_size_elements,), dtype=dtype, device=device
+        )
+        ordinary_clone = ordinary_input.clone()
+        ordinary_output = cuda_communicator.reduce_scatter(ordinary_input, dim=0)
+        ordinary_expected = torch.empty(per_rank_size, dtype=dtype, device=device)
+        dist.reduce_scatter_tensor(
+            ordinary_expected, ordinary_clone, group=get_tp_group().device_group
+        )
+        torch.testing.assert_close(
+            ordinary_output, ordinary_expected, atol=2.5, rtol=0.1
+        )
+
         if pynccl_comm.nccl_version < 23004:
-            pytest.skip("Registered-input/nonregistered-output RS requires NCCL 2.30.4")
+            return
 
         with nccl_symm_mem_context(pynccl_comm):
             input_tensor = torch.empty(test_size_elements, dtype=dtype, device=device)
@@ -243,6 +267,24 @@ def nccl_symm_mem_reduce_scatter_worker(local_rank: int, world_size: int):
         expected = torch.empty(per_rank_size, dtype=dtype, device=device)
         dist.reduce_scatter_tensor(expected, input_clone, group=group)
         torch.testing.assert_close(result, expected, atol=2.5, rtol=0.1)
+
+        dist.barrier(group=get_tp_group().cpu_group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_result = cuda_communicator.reduce_scatterv(
+                input_tensor,
+                dim=0,
+                sizes=[per_rank_size] * world_size,
+                output=output,
+            )
+        assert graph_result.data_ptr() == output.data_ptr()
+
+        input_tensor.random_(24, 47)
+        input_clone.copy_(input_tensor)
+        dist.reduce_scatter_tensor(expected, input_clone, group=group)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, atol=2.5, rtol=0.1)
 
 
 @pytest.mark.skipif(
