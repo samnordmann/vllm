@@ -145,6 +145,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
         is_sequence_parallel: bool = False,
     ) -> torch.Tensor | None:
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+        assert sizes is not None
+        if sizes.count(sizes[0]) != len(sizes):
+            return None
         device_communicator = dist_group.device_communicator
         if device_communicator is None:
             return None
