@@ -15,6 +15,7 @@ from vllm.distributed.device_communicators.all_reduce_utils import (
 from vllm.distributed.device_communicators.pynccl import register_nccl_symmetric_ops
 from vllm.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
+    is_symmetric_memory_tensor,
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -439,7 +440,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # from variable per-rank sizes cause deadlocks.
         if sizes is not None and sizes.count(sizes[0]) == len(sizes):
             sizes = None
-        use_symm_mem = sizes is None and should_nccl_symm_mem_ag_rs()
+        use_symm_mem = (
+            sizes is None
+            and should_nccl_symm_mem_ag_rs()
+            and is_symmetric_memory_tensor(input_tensor)
+        )
         if use_symm_mem:
             output = self._reduce_scatter_symm_mem(input_tensor, output)
         else:
@@ -529,22 +534,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         pynccl_comm.reduce_scatter(output, symm_input)
         return output
-
-    def get_symmetric_memory_buffer(
-        self,
-        role: str,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        pynccl_comm = self.pynccl_comm
-        if (
-            pynccl_comm is None
-            or pynccl_comm.nccl_version < 23004
-            or not should_nccl_symm_mem_ag_rs()
-        ):
-            return None
-        return self._get_symm_scratch(role, shape, dtype, device)
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""

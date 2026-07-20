@@ -289,15 +289,6 @@ class DeviceCommunicatorBase:
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def get_symmetric_memory_buffer(
-        self,
-        role: str,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        return None
-
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
     ) -> torch.Tensor | None:

@@ -19,6 +19,7 @@ from vllm.utils.flashinfer import (
 from vllm.utils.func_utils import supports_kw
 from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_mori
 
+from .all_reduce_utils import should_nccl_symm_mem_ag_rs
 from .base_device_communicator import All2AllManagerBase, Cache
 
 if has_flashinfer_nvlink_two_sided():
@@ -48,6 +49,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
+        self._combine_inputs: dict[
+            tuple[tuple[int, ...], torch.dtype, torch.device], torch.Tensor
+        ] = {}
 
     def _get_comm_group(self, is_sequence_parallel: bool) -> Any:
         if is_sequence_parallel:
@@ -159,12 +163,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
         sizes = self._get_sizes(shape[0] // dist_group.world_size, dist_group)
         if sizes.count(sizes[0]) != len(sizes):
             return None
-        device_communicator = dist_group.device_communicator
-        if device_communicator is None:
+        if not should_nccl_symm_mem_ag_rs():
             return None
-        return device_communicator.get_symmetric_memory_buffer(
-            "moe_ag_rs_combine", shape, dtype, device
-        )
+        key = (shape, dtype, device)
+        if key not in self._combine_inputs:
+            self._combine_inputs[key] = torch.empty(shape, dtype=dtype, device=device)
+        return self._combine_inputs[key]
 
     def combine_into_output(
         self,
@@ -182,7 +186,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         )
 
     def destroy(self):
-        pass
+        self._combine_inputs.clear()
 
 
 class DeepEPAll2AllManagerBase(All2AllManagerBase):
