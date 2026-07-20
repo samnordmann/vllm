@@ -144,7 +144,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         device: torch.device,
         is_sequence_parallel: bool = False,
     ) -> torch.Tensor | None:
-        dist_group = self._get_comm_group(is_sequence_parallel)
+        dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         device_communicator = dist_group.device_communicator
         if device_communicator is None:
             return None
@@ -158,11 +158,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
         output: torch.Tensor,
         is_sequence_parallel: bool = False,
     ) -> torch.Tensor:
-        dist_group = self._get_comm_group(is_sequence_parallel)
-        sizes = self._get_sizes(
-            hidden_states.shape[0] // dist_group.world_size,
-            dist_group,
-        )
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+        assert sizes is not None
+        dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         return dist_group.reduce_scatterv(
             hidden_states, dim=0, sizes=sizes, output=output
         )
