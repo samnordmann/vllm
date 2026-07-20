@@ -717,12 +717,15 @@ class GroupCoordinator:
         dim: int = -1,
         sizes: list[int] | None = None,
         output: torch.Tensor | None = None,
+        use_symmetric_memory: bool | None = None,
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        if output is None:
+        if output is None and use_symmetric_memory is None:
             return self.device_communicator.reduce_scatterv(input_, dim, sizes)
-        return self.device_communicator.reduce_scatterv(input_, dim, sizes, output)
+        return self.device_communicator.reduce_scatterv(
+            input_, dim, sizes, output, use_symmetric_memory
+        )
 
     def _reduce_scatter_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:

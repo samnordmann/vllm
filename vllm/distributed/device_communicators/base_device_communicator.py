@@ -286,6 +286,7 @@ class DeviceCommunicatorBase:
         dim: int = -1,
         sizes: list[int] | None = None,
         output: torch.Tensor | None = None,
+        use_symmetric_memory: bool | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 

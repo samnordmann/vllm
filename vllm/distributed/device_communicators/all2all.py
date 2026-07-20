@@ -182,7 +182,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
             dist_group,
         )
         return dist_group.reduce_scatterv(
-            hidden_states, dim=0, sizes=sizes, output=output
+            hidden_states,
+            dim=0,
+            sizes=sizes,
+            output=output,
+            use_symmetric_memory=False,
         )
 
     def destroy(self):

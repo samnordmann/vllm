@@ -408,6 +408,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         dim: int = -1,
         sizes: list[int] | None = None,
         output: torch.Tensor | None = None,
+        use_symmetric_memory: bool | None = None,
     ):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -440,11 +441,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # from variable per-rank sizes cause deadlocks.
         if sizes is not None and sizes.count(sizes[0]) == len(sizes):
             sizes = None
-        use_symm_mem = (
-            sizes is None
-            and should_nccl_symm_mem_ag_rs()
-            and is_symmetric_memory_tensor(input_tensor)
-        )
+        if use_symmetric_memory is None:
+            use_symmetric_memory = should_nccl_symm_mem_ag_rs() and (
+                is_symmetric_memory_tensor(input_tensor)
+            )
+        use_symm_mem = sizes is None and use_symmetric_memory
         if use_symm_mem:
             output = self._reduce_scatter_symm_mem(input_tensor, output)
         else:
