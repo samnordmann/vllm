@@ -160,7 +160,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if device_communicator is None:
             return None
         return device_communicator.get_symmetric_memory_buffer(
-            "moe_agrs_combine", shape, dtype, device
+            "moe_ag_rs_combine", shape, dtype, device
         )
 
     def combine_into_output(
