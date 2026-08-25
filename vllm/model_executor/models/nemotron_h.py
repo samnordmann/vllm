@@ -24,6 +24,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.parallel import ParallelConfig
@@ -203,7 +204,11 @@ class NemotronHMoE(nn.Module):
                 disable_tp=self.is_sequence_parallel,
                 prefix=f"{prefix}.fc2_latent_proj",
             )
-            self._latent_proj_stream = aux_stream()
+            self._latent_proj_stream = (
+                aux_stream()
+                if envs.VLLM_EXPERIMENTAL_NEMOTRON_GATE_LATENT_OVERLAP
+                else None
+            )
             self._latent_proj_events = (torch.cuda.Event(), torch.cuda.Event())
         else:
             self.fc1_latent_proj = None
