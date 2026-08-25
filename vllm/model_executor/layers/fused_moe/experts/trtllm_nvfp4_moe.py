@@ -407,7 +407,9 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             do_finalize=not defer_finalize,
             activation_type=activation_to_flashinfer_int(activation),
             per_token_scale=per_token_scale,
-            output=None if defer_finalize else output,
+            # FlashInfer does not write this tensor when do_finalize=False,
+            # but providing it avoids allocating an otherwise unused output.
+            output=output,
             tune_max_num_tokens=min(
                 fi_moe_largest_bucket(self.moe_config), self._get_chunk_size()
             ),
