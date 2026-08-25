@@ -356,7 +356,7 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
     def finalize(
         self,
         output: torch.Tensor,
-        fused_expert_output: torch.Tensor,
+        fused_expert_output: torch.Tensor | UnfinalizedMoEOutput,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
@@ -933,7 +933,7 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         workspace2: torch.Tensor,
         expert_tokens_meta: ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
-    ) -> None:
+    ) -> UnfinalizedMoEOutput | None:
         """
         This function computes the intermediate result of a Mixture of Experts
         (MoE) layer using two sets of weights, w1 and w2.
@@ -1295,7 +1295,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | UnfinalizedMoEOutput:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
         )
@@ -1343,7 +1343,7 @@ class FusedMoEKernelModularImpl:
         elif use_output_alias:
             fused_out = output_alias
 
-        self.fused_experts.apply(
+        deferred_output = self.fused_experts.apply(
             output=fused_out,
             hidden_states=a1q,
             w1=w1,
@@ -1361,12 +1361,15 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
+        if isinstance(deferred_output, UnfinalizedMoEOutput):
+            return deferred_output
+
         return fused_out
 
     def _finalize(
         self,
         output: torch.Tensor,
-        fused_out: torch.Tensor,
+        fused_out: torch.Tensor | UnfinalizedMoEOutput,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -1674,10 +1677,9 @@ class FusedMoEKernel:
         return self.prepare_finalize.output_is_reduced()
 
     def supports_deferred_moe_finalize(self) -> bool:
-        return (
-            isinstance(self.prepare_finalize, FusedMoEPrepareAndFinalizeMonolithic)
-            and self.prepare_finalize.supports_deferred_moe_finalize()
-        )
+        if isinstance(self.prepare_finalize, FusedMoEPrepareAndFinalizeMonolithic):
+            return self.prepare_finalize.supports_deferred_moe_finalize()
+        return self.moe_config.use_deferred_moe_finalize
 
     def apply_monolithic(
         self,

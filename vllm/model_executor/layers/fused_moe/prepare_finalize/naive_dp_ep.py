@@ -2,15 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.distributed import get_ep_group
+from vllm.distributed import get_dp_group, get_ep_group
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+
+logger = init_logger(__name__)
 
 
 def _quantize_and_setup_dispatch(
@@ -84,11 +93,85 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         super().__init__()
         self.is_sequence_parallel = is_sequence_parallel
         self._num_dispatchers = num_dispatchers
+        self._deferred_reduce_scatter = None
+        self._defer_this_call = False
+        self._moe_config = None
         # Set by FusedMoEWithLoRA.set_mapping() when LoRA is active. When
         # present, prepare() dispatches the per-token LoRA mapping alongside
         # hidden_states and writes the gathered result back to the context so
         # experts can use the per-rank-local mapping.
         self._lora_context = None
+
+    def post_init_setup(self, fused_experts: mk.FusedMoEExperts) -> None:
+        self._moe_config = fused_experts.moe_config
+        if not envs.VLLM_EXPERIMENTAL_NEMOTRON_DEFERRED_EP_FINALIZE:
+            return
+
+        from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+            TrtLlmNvFp4ExpertsModular,
+        )
+
+        config = fused_experts.moe_config
+        parallel = config.moe_parallel_config
+        if not (
+            isinstance(fused_experts, TrtLlmNvFp4ExpertsModular)
+            and config.in_dtype == torch.bfloat16
+            and config.hidden_dim_unpadded == 2048
+            and config.experts_per_token == 22
+            and config.num_experts == 512
+            and parallel.tp_size == 1
+            and parallel.dp_size > 1
+            and parallel.ep_size == parallel.dp_size
+            and parallel.pcp_size == 1
+            and parallel.use_ep
+            and not parallel.is_sequence_parallel
+            and not parallel.enable_eplb
+        ):
+            logger.warning_once(
+                "Experimental Nemotron deferred EP finalization was requested "
+                "for an unsupported MoE configuration; using the standard path."
+            )
+            return
+
+        from vllm.model_executor.layers.fused_moe.cute_dsl import (
+            DeferredTopKReduceScatter,
+        )
+
+        max_local_tokens = (
+            envs.VLLM_EXPERIMENTAL_NEMOTRON_DEFERRED_EP_FINALIZE_MAX_TOKENS
+        )
+        group = get_dp_group().device_group
+        self._deferred_reduce_scatter = DeferredTopKReduceScatter.initialize(
+            group=group,
+            hidden_dim=config.hidden_dim_unpadded,
+            top_k=config.experts_per_token,
+            max_local_tokens=max_local_tokens,
+        )
+        config.defer_moe_finalize_max_num_tokens = max_local_tokens * parallel.dp_size
+        logger.info_once(
+            "Experimental fused NVFP4 top-k finalization and EP reduce-scatter "
+            "is available for uniform batches up to %d tokens/rank.",
+            max_local_tokens,
+        )
+
+    def _should_defer_finalize(self, local_tokens: int) -> bool:
+        op = self._deferred_reduce_scatter
+        if (
+            op is None
+            or local_tokens <= 0
+            or local_tokens > op.contract.max_local_tokens
+            or not is_forward_context_available()
+        ):
+            return False
+        metadata = get_forward_context().dp_metadata
+        if metadata is None:
+            return False
+        sizes = metadata.get_chunk_sizes_across_dp_rank()
+        return (
+            sizes is not None
+            and len(sizes) == op.contract.world_size
+            and all(size == local_tokens for size in sizes)
+        )
 
     def set_lora_context(self, ctx) -> None:
         self._lora_context = ctx
@@ -121,6 +204,10 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
         """Quantize and Dispatch Topk Weights and Topk Ids."""
+
+        self._defer_this_call = self._should_defer_finalize(a1.shape[0])
+        if self._moe_config is not None:
+            self._moe_config.defer_moe_finalize = self._defer_this_call
 
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
@@ -187,12 +274,21 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
     def finalize(
         self,
         output: torch.Tensor,
-        fused_expert_output: torch.Tensor,
+        fused_expert_output: torch.Tensor | UnfinalizedMoEOutput,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
+        if isinstance(fused_expert_output, UnfinalizedMoEOutput):
+            if not self._defer_this_call or self._deferred_reduce_scatter is None:
+                raise RuntimeError(
+                    "Received a deferred MoE output without an active fused "
+                    "reduce-scatter consumer."
+                )
+            self._deferred_reduce_scatter(fused_expert_output, output)
+            return
+
         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
             weight_and_reduce_impl = TopKWeightAndReduceContiguous()
 

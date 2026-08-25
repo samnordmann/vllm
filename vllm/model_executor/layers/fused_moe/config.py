@@ -1449,13 +1449,16 @@ class FusedMoEConfig:
         ``defer_moe_finalize`` is set after construction, like
         ``skip_final_all_reduce``.
         """
-        # The consumer fuses a TP all-reduce. Other parallel modes require a
-        # combine or reduce-scatter after the experts and cannot defer it.
+        tp_tail = self.tp_size > 1 and self.dp_size == 1 and self.ep_size == 1
+        ep_tail = (
+            self.tp_size == 1
+            and self.dp_size > 1
+            and self.ep_size == self.dp_size
+            and self.use_ep
+        )
         return (
             self.defer_moe_finalize
-            and self.tp_size > 1
-            and self.dp_size == 1
-            and self.ep_size == 1
+            and (tp_tail or ep_tail)
             and self.pcp_size == 1
             and not self.is_sequence_parallel
         )
