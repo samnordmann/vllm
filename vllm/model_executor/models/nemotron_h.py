@@ -82,7 +82,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
-from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
 
 _ROUTER_LATENT_PROJ_STREAM_TOKEN_THRESHOLD = 256
@@ -252,15 +251,24 @@ class NemotronHMoE(nn.Module):
 
         assert self._latent_proj_events is not None
         num_tokens = hidden_states.shape[0]
-        (router_logits, _), (routed_hidden_states, _) = maybe_execute_in_parallel(
-            lambda: self.gate(hidden_states),
-            lambda: latent_proj(hidden_states),
-            self._latent_proj_events[0],
-            self._latent_proj_events[1],
+        stream = (
             self._latent_proj_stream
             if num_tokens <= _ROUTER_LATENT_PROJ_STREAM_TOKEN_THRESHOLD
-            else None,
+            else None
         )
+        if stream is None:
+            router_logits, _ = self.gate(hidden_states)
+            routed_hidden_states, _ = latent_proj(hidden_states)
+            return routed_hidden_states, router_logits
+
+        start_event, done_event = self._latent_proj_events
+        start_event.record()
+        with torch.cuda.stream(stream):
+            start_event.wait()
+            routed_hidden_states, _ = latent_proj(hidden_states)
+            done_event.record()
+        router_logits, _ = self.gate(hidden_states)
+        done_event.wait()
         return routed_hidden_states, router_logits
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
