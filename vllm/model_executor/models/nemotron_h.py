@@ -81,6 +81,10 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.torch_utils import aux_stream
+
+_ROUTER_LATENT_PROJ_STREAM_TOKEN_THRESHOLD = 256
 
 
 class NemotronHMLP(nn.Module):
@@ -199,9 +203,13 @@ class NemotronHMoE(nn.Module):
                 disable_tp=self.is_sequence_parallel,
                 prefix=f"{prefix}.fc2_latent_proj",
             )
+            self._latent_proj_stream = aux_stream()
+            self._latent_proj_events = (torch.cuda.Event(), torch.cuda.Event())
         else:
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
+            self._latent_proj_stream = None
+            self._latent_proj_events = None
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
@@ -229,6 +237,27 @@ class NemotronHMoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
         )
 
+    def _router_and_latent_proj(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        latent_proj = self.fc1_latent_proj
+        if latent_proj is None:
+            router_logits, _ = self.gate(hidden_states)
+            return hidden_states, router_logits
+
+        assert self._latent_proj_events is not None
+        num_tokens = hidden_states.shape[0]
+        (router_logits, _), (routed_hidden_states, _) = maybe_execute_in_parallel(
+            lambda: self.gate(hidden_states),
+            lambda: latent_proj(hidden_states),
+            self._latent_proj_events[0],
+            self._latent_proj_events[1],
+            self._latent_proj_stream
+            if num_tokens <= _ROUTER_LATENT_PROJ_STREAM_TOKEN_THRESHOLD
+            else None,
+        )
+        return routed_hidden_states, router_logits
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -236,11 +265,14 @@ class NemotronHMoE(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        routed_hidden_states, router_logits = self._router_and_latent_proj(
+            hidden_states
+        )
 
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=routed_hidden_states,
+            router_logits=router_logits,
+            shared_experts_input=hidden_states if self.use_latent_moe else None,
         )
 
         if self.is_sequence_parallel:
