@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -16,8 +16,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
-from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
-from vllm.models.kimi_k3.nvidia.ops.cute_dsl.latent_moe_tail.primitives import (
+from .primitives import (
     NUM_LAMPORT_BUFFERS,
     PACKED_BYTES,
     VEC_BF16,
@@ -33,6 +32,9 @@ from vllm.models.kimi_k3.nvidia.ops.cute_dsl.latent_moe_tail.primitives import (
     to_cute,
     to_cute_dynamic_m,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 
 _DEFAULT_TOKEN_CTAS = 16
 _SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
