@@ -17,7 +17,6 @@ from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_nvlink_two_sided,
 )
-from vllm.utils.func_utils import supports_kw
 from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_mori
 
 from .base_device_communicator import All2AllManagerBase, Cache
@@ -726,7 +725,6 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         self.max_num_tokens = 0
         self.top_k = 0
         self.num_experts = 0
-        self._combine_supports_output = False
 
     def initialize(
         self,
@@ -827,13 +825,6 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             workspace_size_per_rank=self.workspace_size,
             mnnvl_config=ep_config,
         )
-        try:
-            self._combine_supports_output = supports_kw(
-                self.moe_alltoall.combine, "output", allow_var_kwargs=False
-            )
-        except (TypeError, ValueError):
-            self._combine_supports_output = False
-
         self.gpus_per_node = gpus_per_node
         self.initialized = True
 
@@ -853,20 +844,13 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         runtime_max_tokens_per_rank: int,
         output: torch.Tensor,
     ) -> None:
-        """Combine into ``output``, with a fallback for older FlashInfer."""
+        """Stage FlashInfer combine output, then copy into ``output``."""
         assert self.moe_alltoall is not None
-        if self._combine_supports_output:
-            self.moe_alltoall.combine(
-                payload=payload,
-                runtime_max_tokens_per_rank=runtime_max_tokens_per_rank,
-                output=output,
-            )
-        else:
-            combined_output = self.moe_alltoall.combine(
-                payload=payload,
-                runtime_max_tokens_per_rank=runtime_max_tokens_per_rank,
-            )
-            output.copy_(combined_output)
+        combined_output = self.moe_alltoall.combine(
+            payload=payload,
+            runtime_max_tokens_per_rank=runtime_max_tokens_per_rank,
+        )
+        output.copy_(combined_output)
 
     def get_handle(self, kwargs):
         return self
