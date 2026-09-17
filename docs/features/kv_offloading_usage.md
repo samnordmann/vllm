@@ -199,126 +199,14 @@ Block content hashes must match across instances for peers to exchange blocks (s
 | `port` | no | `$VLLM_P2P_SIDE_CHANNEL_PORT` (`5710`) | Base port for the control socket. Must be reachable from peers. The bound port is `base + data_parallel_index` (one socket per DP replica). When omitted, the base resolves from the env var below. |
 | `backends` | no | `["UCX"]` | NIXL transport backends. See [NixlConnector Usage Guide](nixl_connector_usage.md#selecting-a-nixl-transport-backend-plugin) for available backends and selection guidance. |
 | `num_threads` | no | `4` | NIXL agent worker threads. Only used when `backends` is UCX-only; ignored when any non-UCX backend is requested. |
-| `data_transport` | no | `"nixl"` | Data plane: `"nixl"` uses the native integration; `"torch"` opts into the experimental `torch.distributed._transfer` adapter. |
-| `transfer_backend` | no | `"nixl"` | PyTorch transfer provider when `data_transport="torch"`. |
-| `transfer_progress_mode` | no | `"background"` | PyTorch transfer progress contract. Background is the parity default because the native NIXL agent enables its progress thread. |
-| `transfer_thread_mode` | no | `"single"` | PyTorch transfer thread-safety contract. The P2P manager is scheduler-thread-owned, so its default avoids serialized-mode locking; explicitly select another mode if calls cross threads. |
-| `transfer_options` | no | `{}` | Provider-specific PyTorch transfer options. For the NIXL provider, the manager fills in `backends`, `num_threads`, and telemetry settings from the native P2P configuration unless explicitly overridden here. |
+| `transfer_api` | no | `"native"` | `"torch"` routes the existing P2P data plane through the experimental `torch.distributed._transfer` API and `nixl.torch_transfer` provider. |
+
+The `torch` mode is a success-path review prototype, requiring both prototype
+packages. It keeps the existing control protocol and native default. Active
+cancellation, failure recovery and GPU/end-to-end performance are not validated;
+do not deploy this mode in production. This does not change `NixlConnector`.
 
 The `backends` and `num_threads` options mirror the conditional logic used by [`NixlConnector`](nixl_connector_usage.md#selecting-a-nixl-transport-backend-plugin): when any non-UCX backend is configured, NIXL is initialised with `backends=...`; otherwise it falls back to a UCX-only agent with the configured `num_threads`. This lets the P2P tier use a different transport (e.g. `MOONCAKE`, `GDS_MT`, `LIBFABRIC`) than the main `NixlConnector` running in the same process.
-
-The experimental PyTorch NIXL provider currently accepts only `backends=["UCX"]`.
-Selecting `data_transport="torch"` with another P2P backend therefore fails
-explicitly instead of silently choosing a different data path.
-The adapter binds the Core endpoint ID to the existing `host:port` control
-identity and rejects peer metadata whose endpoint ID does not match the peer
-that completed that control-plane handshake.
-
-Both P2P data planes also implement exact-identity recovery for the narrow
-interval in which a native/Core transfer has been created but Python has not
-yet stored its returned transfer ID. The session publishes a private submission
-guard before transport entry, passes that same object as an opaque recovery
-token, and commits the guard last after its primary transfer map, request index,
-and round count are durable. Recovery is peer-scoped and compares identity with
-`is`; it never hashes, serializes, or sends the token. A recovered interrupted
-attempt is conservatively failed and wait-cancelled before its source blocks are
-released. An ambiguous result or a transport without recovery support fails
-closed and retains those blocks. Successful submissions do not scan recovery
-state; the extra session work is two guard-pointer stores around the existing
-ownership writes, plus constant-time unresolved-guard and exact-ID validation.
-Capability selection is cached at session construction; no recovery registry is
-scanned on success.
-
-Completion ownership is likewise explicit from the data transport to the top
-tiering manager. Native NIXL and PyTorch transports retain terminal transfer
-outcomes until their session acknowledges them; sessions and the P2P manager
-repeat that keyed peek/adopt/ack handoff. The top manager acknowledges a
-secondary result only after publishing its own receipt, and removes the job only
-after every required completion effect commits. This prevents an asynchronous
-interruption between a returned result and its next Python assignment from
-silently losing that result or applying it twice.
-
-Abort is a quiescence handshake, not a deadline-based failure shortcut. The
-consumer journals an `(kv_request_id, round_seq)` abort intent before sending
-it and retries the same identity after an acknowledgement timeout. The producer
-sends `AbortAck` only after wait-mode cancellation proves every matching write
-terminal, retains an acknowledgement tombstone for duplicate aborts, and
-removes the pending send only after the control transport accepts it. If a
-session dies without that proof, vLLM deliberately quarantines the promotion
-job and its CPU destination: it does not publish a normal failed completion,
-remove the peer, reset the cache, or release primary memory that a remote DMA
-could still modify. In particular, an ordinary ZMQ/control disconnect is not a
-hard NIXL data-plane teardown. This fail-closed state requires a future explicit
-quiescence contract or worker restart.
-
-`round_seq` is an exact unsigned 64-bit, session-global operation token, not a
-counter owned by prunable per-request state. Every lookup/fetch generation gets
-a strictly increasing token, including a terminal empty `FetchMsg`; request-ID
-reuse therefore cannot make an old `AbortAck`, `TransferDone`, or lookup answer
-refer to new memory. `LookupRespMsg` must echo the `LookupMsg` token, and the
-consumer ignores a delayed response unless it matches the currently open
-generation. Missing, Boolean, negative, or out-of-range tokens are protocol
-errors. The allocator never wraps: after issuing `2**64 - 1`, the session
-refuses new work and must be replaced. This is a coordinated wire-protocol
-revision; mixed peers that omit the `LookupRespMsg` token fail closed during
-validation rather than silently falling back to request-ID-only matching.
-
-The P2P control wire is version `1.0` with no implicit legacy fallback. Each
-`P2PSession` creates a cryptographically random, nonzero 128-bit epoch; zero is
-reserved as the discovery target. A Connect candidate is not imported and
-queued work is not released until the peer supplies both a Connect targeting
-the current local epoch and a matching Ack naming that same remote epoch. An
-unready session retries its immutable discovery Connect every 500 ms, so a
-first attempt rejected while an old same-ID session retires is not lost. A
-ready session receiving a different discovery epoch withholds its Ack and sends
-a targeted challenge. It retires only after that successor returns both the
-targeted Connect and matching Ack; replacement metadata is imported later by a
-fresh session, after manager-owned data-plane quiescence and peer removal. A
-lone stale Connect or Ack therefore cannot displace a healthy session.
-
-Every Fetch, Lookup, response, terminal, abort, acknowledgement, and Disconnect
-then carries the exact source and target epochs. Frames from a retired epoch are
-dropped before request, role, transfer, or manager state can change; malformed
-frames on the current channel fail the session. The config fingerprint is
-mandatory and must match exactly, including empty versus non-empty values.
-Protocol integers exclude Boolean values, remote memory spans and control lists
-are bounded, and Fetch destination indexes must fit the requester's advertised
-block count.
-
-Epochs prevent a delayed frame from an old connection incarnation being
-mistaken for current work; they are freshness values, not authentication. The
-ZMQ control plane remains trusted and unauthenticated. Its stable `host:port`
-routing identity is retained because the peer uses that value to open the
-reverse DEALER connection. Deploy this feature only on a trusted or separately
-secured network. Control messages are capped at 64 MiB; tensor payloads remain
-on the NIXL/PyTorch data plane and are not copied into those messages.
-
-If PyTorch/Core construction fails and child cleanup also fails, the original
-exception exposes `recovery_transport`. Calling
-`exception.recovery_transport.close()` retries the exact Registration and
-Endpoint owners child-first; the adapter does not clear them after a failed
-rollback attempt.
-
-Two interruption windows deliberately fail closed because the current primary
-tier API exposes neither an idempotency key nor an adoption query. Before a
-cascade calls non-idempotent `primary.complete_read`, the top manager records
-`RELEASE_ENTERED`; if the call does not return cleanly, it never retries or
-speculatively decrements the pin. Before store-job construction calls
-`primary.prepare_read`, it publishes the job ID and an acquisition receipt; an
-ambiguous return is never retried or speculatively unpinned. Either condition
-quarantines the manager and blocks further allocation, lookup, completion,
-eviction, reset, and teardown from reporting false convergence. Operators must
-treat that deterministic fail-stop as process-fatal and restart the affected
-worker. Resolving the quarantine without restart requires a future primary-tier
-operation token or query API. These receipts run only on completion and job
-construction paths, not indexed DMA submission or nonterminal polling.
-
-The PyTorch data plane also requires the versioned adoptive factory contract:
-Core must export an exact-integer `BACKEND_FACTORY_API_VERSION` of at least 2
-and `BackendFactoryV2`, while the NIXL provider must export the exact-integer
-`TORCH_TRANSFER_FACTORY_API_VERSION == 2`. Older or ambiguous combinations are
-rejected during construction; the adapter never silently falls back to the
-outcome-ambiguous v1 factory contract.
 
 #### Environment Variables
 

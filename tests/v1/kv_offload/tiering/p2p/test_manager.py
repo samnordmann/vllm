@@ -11,7 +11,6 @@ from __future__ import annotations
 import time
 import uuid
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -113,21 +112,13 @@ def _make_manager() -> P2PSecondaryTierManager:
     mgr = P2PSecondaryTierManager.__new__(P2PSecondaryTierManager)
     mgr._local_id = "127.0.0.1:7777"
     mgr._hash_seed = "0"
-    mgr._finished_jobs = {}
+    mgr._finished_jobs = []
     mgr._failed_req_ids = set()
     mgr._sessions = {}
-    mgr._retiring_sessions = {}
     mgr._kv_to_session = {}
     mgr._unbound_stores = {}
     mgr._failed_serve_ctxs = []
-    mgr._data = None  # type: ignore[assignment]
-    mgr._closing = False
-    mgr._closed = False
     return mgr
-
-
-def _finished_results(mgr: P2PSecondaryTierManager) -> list[JobResult]:
-    return list(mgr._finished_jobs.values())
 
 
 def _init_offloading_spec() -> SimpleNamespace:
@@ -136,27 +127,6 @@ def _init_offloading_spec() -> SimpleNamespace:
         config=SimpleNamespace(parallel=SimpleNamespace(data_parallel_index=0)),
         blocks_per_chunk=1,
     )
-
-
-class _ConstructorFailure(BaseException):
-    pass
-
-
-class _ConstructorResource:
-    def __init__(
-        self,
-        *,
-        available: bool = True,
-        close_error: BaseException | None = None,
-    ) -> None:
-        self.available = available
-        self.close_error = close_error
-        self.close_calls = 0
-
-    def close(self) -> None:
-        self.close_calls += 1
-        if self.close_error is not None:
-            raise self.close_error
 
 
 # ---------------------------------------------------------------------------
@@ -206,108 +176,6 @@ class TestInitHashSeed:
             manager_module, "get_none_hash_seed", lambda: "random-seed-abc"
         )
         assert mgr._get_hash_seed() == "random-seed-abc"
-
-
-class TestConstructorRollback:
-    @staticmethod
-    def _patch_file_mapper(monkeypatch) -> None:
-        monkeypatch.setattr(
-            manager_module.FileMapper,
-            "from_offloading_spec",
-            lambda **_: SimpleNamespace(get_run_config=lambda: {}),
-        )
-
-    @pytest.mark.parametrize("data_transport", ["nixl", "torch"])
-    def test_control_failure_closes_only_selected_data_transport(
-        self, monkeypatch, data_transport
-    ):
-        self._patch_file_mapper(monkeypatch)
-        primary = _ConstructorFailure("control construction")
-        nixl = _ConstructorResource()
-        torch = _ConstructorResource()
-        nixl_factory = MagicMock(return_value=nixl)
-        torch_factory = MagicMock(return_value=torch)
-        monkeypatch.setattr(manager_module, "NixlTransport", nixl_factory)
-        monkeypatch.setattr(manager_module, "TorchTransferTransport", torch_factory)
-
-        def fail_control(*args, **kwargs):
-            raise primary
-
-        monkeypatch.setattr(manager_module, "ZmqTransport", fail_control)
-        with pytest.raises(_ConstructorFailure) as raised:
-            P2PSecondaryTierManager(
-                _init_offloading_spec(),
-                memoryview(bytearray(16)),
-                data_transport=data_transport,
-            )
-
-        assert raised.value is primary
-        selected, unselected = (
-            (nixl, torch) if data_transport == "nixl" else (torch, nixl)
-        )
-        assert selected.close_calls == 1
-        assert unselected.close_calls == 0
-        assert nixl_factory.call_count == (data_transport == "nixl")
-        assert torch_factory.call_count == (data_transport == "torch")
-
-    def test_unavailable_torch_transport_is_closed_before_control(self, monkeypatch):
-        self._patch_file_mapper(monkeypatch)
-        data = _ConstructorResource(available=False)
-        monkeypatch.setattr(
-            manager_module, "TorchTransferTransport", MagicMock(return_value=data)
-        )
-        control_factory = MagicMock(
-            side_effect=AssertionError("control must not be constructed")
-        )
-        monkeypatch.setattr(manager_module, "ZmqTransport", control_factory)
-
-        with pytest.raises(RuntimeError, match="requires an available"):
-            P2PSecondaryTierManager(
-                _init_offloading_spec(),
-                memoryview(bytearray(16)),
-                data_transport="torch",
-            )
-
-        assert data.close_calls == 1
-        control_factory.assert_not_called()
-
-    def test_cleanup_failure_does_not_mask_control_failure(self, monkeypatch):
-        self._patch_file_mapper(monkeypatch)
-        primary = _ConstructorFailure("control construction")
-        cleanup = _ConstructorFailure("data cleanup")
-        data = _ConstructorResource(close_error=cleanup)
-        monkeypatch.setattr(
-            manager_module, "NixlTransport", MagicMock(return_value=data)
-        )
-
-        def fail_control(*args, **kwargs):
-            raise primary
-
-        monkeypatch.setattr(manager_module, "ZmqTransport", fail_control)
-        with pytest.raises(_ConstructorFailure) as raised:
-            P2PSecondaryTierManager(_init_offloading_spec(), memoryview(bytearray(16)))
-
-        assert raised.value is primary
-        assert data.close_calls == 1
-
-    def test_success_does_not_prematurely_close_transports(self, monkeypatch):
-        self._patch_file_mapper(monkeypatch)
-        data = _ConstructorResource()
-        control = _ConstructorResource()
-        monkeypatch.setattr(
-            manager_module, "NixlTransport", MagicMock(return_value=data)
-        )
-        monkeypatch.setattr(
-            manager_module, "ZmqTransport", MagicMock(return_value=control)
-        )
-
-        manager = P2PSecondaryTierManager(
-            _init_offloading_spec(), memoryview(bytearray(16))
-        )
-
-        assert manager._data is data
-        assert manager._control is control
-        assert data.close_calls == control.close_calls == 0
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +348,7 @@ class TestSubmitStore:
         mgr = _make_manager()
         job = _job_metadata(job_id=1, kv_params={})
         mgr.submit_store(job)
-        assert _finished_results(mgr) == [JobResult(job_id=1, success=True)]
+        assert mgr._finished_jobs == [JobResult(job_id=1, success=True)]
 
     def test_missing_kv_request_id_fails(self):
         """Missing kv_request_id inside ``remote_decoder`` fails the job."""
@@ -488,7 +356,7 @@ class TestSubmitStore:
         params: dict = {"remote_decoder": {}}
         job = _job_metadata(job_id=1, kv_params=params)
         mgr.submit_store(job)
-        assert _finished_results(mgr) == [JobResult(job_id=1, success=False)]
+        assert mgr._finished_jobs == [JobResult(job_id=1, success=False)]
 
     def test_no_binding_yet_parks_in_unbound_stores(self):
         """submit_store without a bound session buffers the batch keyed
@@ -504,14 +372,13 @@ class TestSubmitStore:
         mgr.submit_store(job)
 
         assert mgr._sessions == {}
-        assert mgr._finished_jobs == {}
+        assert mgr._finished_jobs == []
         batches = mgr._unbound_stores["req-1"]
         assert len(batches) == 1
-        batch = batches[1]
         assert (
-            batch.job_id,
-            list(batch.keys),
-            list(batch.block_ids),
+            batches[0].job_id,
+            list(batches[0].keys),
+            list(batches[0].block_ids),
         ) == (
             1,
             [b"k1", b"k2"],
@@ -539,7 +406,7 @@ class TestSubmitStore:
         kv_req_id, keys, _, job_id = bound.stores_added[0]
         assert (kv_req_id, keys, job_id) == ("req-1", [b"k1", b"k2"], 7)
         assert mgr._unbound_stores == {}
-        assert mgr._finished_jobs == {}
+        assert mgr._finished_jobs == []
 
     def test_extra_top_level_keys_are_ignored(self):
         """Producer-side kv_transfer_params should not pre-create a
@@ -567,7 +434,7 @@ class TestSubmitLoad:
         mgr = _make_manager()
         job = _job_metadata(job_id=1, kv_params={})
         mgr.submit_load(job)
-        assert _finished_results(mgr) == [JobResult(job_id=1, success=False)]
+        assert mgr._finished_jobs == [JobResult(job_id=1, success=False)]
 
     def test_empty_keys_succeeds_immediately(self):
         """Empty key list succeeds immediately."""
@@ -576,14 +443,14 @@ class TestSubmitLoad:
             job_id=1, keys=[], block_ids=[], kv_params=_remote_prefiller_kv_params()
         )
         mgr.submit_load(job)
-        assert _finished_results(mgr) == [JobResult(job_id=1, success=True)]
+        assert mgr._finished_jobs == [JobResult(job_id=1, success=True)]
 
     def test_no_session_fails(self):
         """No session for peer fails and marks request failed."""
         mgr = _make_manager()
         job = _job_metadata(job_id=1, kv_params=_remote_prefiller_kv_params())
         mgr.submit_load(job)
-        assert _finished_results(mgr) == [JobResult(job_id=1, success=False)]
+        assert mgr._finished_jobs == [JobResult(job_id=1, success=False)]
         assert "req-1" in mgr._failed_req_ids
 
     def test_happy_path_with_active_session(self):
@@ -602,7 +469,7 @@ class TestSubmitLoad:
         mgr.submit_load(job)
 
         assert existing.requests == [(42, "req-42")]
-        assert mgr._finished_jobs == {}
+        assert mgr._finished_jobs == []
         assert "req-42" not in mgr._failed_req_ids
 
     def test_missing_consumer_flag_fails(self):
@@ -617,7 +484,7 @@ class TestSubmitLoad:
         }
         job = _job_metadata(job_id=1, kv_params=params)
         mgr.submit_load(job)
-        assert _finished_results(mgr) == [JobResult(job_id=1, success=False)]
+        assert mgr._finished_jobs == [JobResult(job_id=1, success=False)]
 
 
 # ---------------------------------------------------------------------------
@@ -684,34 +551,6 @@ class TestOnRequestFinished:
         assert bound.finishes == ["req-1"]
         assert "req-1" not in mgr._kv_to_session
 
-    def test_prefiller_route_unlinks_only_after_finish_returns(self):
-        primary = _ConstructorFailure("finish interrupted")
-
-        class InterruptedFinish(_FakeSession):
-            def __init__(self) -> None:
-                super().__init__(peer_id="some-peer:1", connected=True)
-                self.interrupt = True
-
-            def finish_request(self, kv_request_id):
-                if self.interrupt:
-                    self.interrupt = False
-                    raise primary
-                super().finish_request(kv_request_id)
-
-        mgr = _make_manager()
-        session = InterruptedFinish()
-        mgr._kv_to_session["req-1"] = session  # type: ignore[assignment]
-        ctx = _req_context(kv_params=_remote_decoder_kv_params(kv_request_id="req-1"))
-
-        with pytest.raises(_ConstructorFailure) as raised:
-            mgr.on_request_finished(ctx)
-        assert raised.value is primary
-        assert mgr._kv_to_session["req-1"] is session
-
-        mgr.on_request_finished(ctx)
-        assert session.finishes == ["req-1"]
-        assert "req-1" not in mgr._kv_to_session
-
     def test_prefiller_unbound_id_leaves_batches_parked(self):
         """Prefiller-side finish for an id with parked unbound batches
         and no session binding is a no-op on `_unbound_stores`. The
@@ -721,15 +560,15 @@ class TestOnRequestFinished:
         from vllm.v1.kv_offload.tiering.p2p.manager import _UnboundStoreBatch
 
         mgr = _make_manager()
-        mgr._unbound_stores["req-1"] = {
-            10: _UnboundStoreBatch(job_id=10, keys=[b"k"], block_ids=[0]),
-            11: _UnboundStoreBatch(job_id=11, keys=[b"k2"], block_ids=[1]),
-        }
+        mgr._unbound_stores["req-1"] = [
+            _UnboundStoreBatch(job_id=10, keys=[b"k"], block_ids=[0]),
+            _UnboundStoreBatch(job_id=11, keys=[b"k2"], block_ids=[1]),
+        ]
         ctx = _req_context(kv_params=_remote_decoder_kv_params(kv_request_id="req-1"))
         mgr.on_request_finished(ctx)
         assert "req-1" in mgr._unbound_stores
-        assert list(mgr._unbound_stores["req-1"]) == [10, 11]
-        outcomes = {(r.job_id, r.success) for r in _finished_results(mgr)}
+        assert [b.job_id for b in mgr._unbound_stores["req-1"]] == [10, 11]
+        outcomes = {(r.job_id, r.success) for r in mgr._finished_jobs}
         assert (10, False) not in outcomes
         assert (11, False) not in outcomes
 
@@ -742,15 +581,6 @@ class TestOnRequestFinished:
 class _FakeServerHalf:
     def __init__(self) -> None:
         self._inflight: dict[int, object] = {}
-        self.reconcile_calls = 0
-        self.recover_on_reconcile: dict[int, object] = {}
-        self.reconcile_error: BaseException | None = None
-
-    def reconcile_submitting_transfer(self) -> None:
-        self.reconcile_calls += 1
-        if self.reconcile_error is not None:
-            raise self.reconcile_error
-        self._inflight.update(self.recover_on_reconcile)
 
     @property
     def has_inflight_transfers(self) -> bool:
@@ -781,30 +611,22 @@ class _FakeSession:
         close_req_ids: list[str] | None = None,
         close_stores: list[int] | None = None,
         close_failed_serves: list[ReqContext] | None = None,
-        close_errors: list[BaseException] | None = None,
-        close_complete: bool = True,
     ) -> None:
         self.peer_id = peer_id
         self.alive = alive
         self.connected = connected
         self.ready = True
-        self._loads = {result.job_id: result for result in loads or ()}
-        self._stores = {result.job_id: result for result in stores or ()}
-        self._new_fetch_ids = dict.fromkeys(new_fetch_ids or ())
+        self._loads = loads or []
+        self._stores = stores or []
+        self._new_fetch_ids = new_fetch_ids or []
         self._close_jobs = close_jobs or []
         self._close_req_ids = close_req_ids or []
         self._close_stores = close_stores or []
         self._close_failed_serves = close_failed_serves or []
-        self._close_errors = list(close_errors or [])
-        self.close_complete = close_complete
-        self.close_calls = 0
         self.requests: list[tuple[int, str]] = []
         self.stores_added: list[tuple[str, list, object, int]] = []
         self.attached: list[object] = []
         self.finishes: list[str] = []
-        self.ack_calls: list[
-            tuple[tuple[int, ...], tuple[int, ...], tuple[str, ...]]
-        ] = []
         # Mirror P2PSession._server._inflight (transfer_id → handle) and
         # P2PSession._client.has_active_loads for the shutdown-drain and
         # drain_jobs paths. Tests populate _server._inflight when needed.
@@ -816,31 +638,15 @@ class _FakeSession:
         return self._client.has_active_loads or self._server.has_inflight_transfers
 
     def poll(self):
-        return self.pending_results()
-
-    def pending_results(self):
-        return SessionPollResult(
-            loads=list(self._loads.values()),
-            stores=list(self._stores.values()),
-            new_fetch_ids=list(self._new_fetch_ids),
+        result = SessionPollResult(
+            loads=self._loads,
+            stores=self._stores,
+            new_fetch_ids=self._new_fetch_ids,
         )
-
-    def ack_results(self, load_job_ids=(), store_job_ids=(), new_fetch_ids=()) -> None:
-        loads = tuple(load_job_ids)
-        stores = tuple(store_job_ids)
-        fetches = tuple(new_fetch_ids)
-        self.ack_calls.append((loads, stores, fetches))
-        for job_id in loads:
-            self._loads.pop(job_id, None)
-        for job_id in stores:
-            self._stores.pop(job_id, None)
-        for kv_request_id in fetches:
-            self._new_fetch_ids.pop(kv_request_id, None)
-
-    def owns_store_job(self, job_id: int) -> bool:
-        return job_id in self._stores or any(
-            stored_job_id == job_id for _, _, _, stored_job_id in self.stores_added
-        )
+        self._loads = []
+        self._stores = []
+        self._new_fetch_ids = []
+        return result
 
     def request_blocks(self, job_id, kv_request_id, keys, block_ids):
         self.requests.append((job_id, kv_request_id))
@@ -856,9 +662,6 @@ class _FakeSession:
         self.finishes.append(kv_request_id)
 
     def close(self):
-        self.close_calls += 1
-        if self._close_errors:
-            raise self._close_errors.pop(0)
         return SessionCloseResult(
             failed_jobs=self._close_jobs,
             failed_req_ids=self._close_req_ids,
@@ -870,10 +673,10 @@ class _FakeSession:
 class TestGetFinished:
     def _make(self) -> P2PSecondaryTierManager:
         mgr = _make_manager()
-        mgr._finished_jobs = {
-            1: JobResult(job_id=1, success=True),
-            2: JobResult(job_id=2, success=False),
-        }
+        mgr._finished_jobs = [
+            JobResult(job_id=1, success=True),
+            JobResult(job_id=2, success=False),
+        ]
 
         class FakeControl:
             def poll(self):
@@ -921,251 +724,6 @@ class TestGetFinished:
         assert "dead:1234" not in mgr._sessions
         assert "req-load" in mgr._failed_req_ids
 
-    def test_reap_retains_dead_session_until_close_retry_succeeds(self):
-        primary = _ConstructorFailure("connection close")
-
-        class FakeData:
-            def __init__(self):
-                self.removed: list[str] = []
-
-            def remove_remote_peer(self, peer_id):
-                self.removed.append(peer_id)
-
-        manager = self._make()
-        data = FakeData()
-        manager._data = data  # type: ignore[assignment]
-        session = _FakeSession(
-            peer_id="dead:1234",
-            alive=False,
-            connected=True,
-            close_jobs=[20],
-            close_errors=[primary],
-        )
-        manager._sessions[session.peer_id] = session  # type: ignore[assignment]
-
-        with pytest.raises(_ConstructorFailure) as raised:
-            manager._reap_dead_sessions()
-
-        assert raised.value is primary
-        assert manager._sessions == {}
-        assert manager._retiring_sessions[session.peer_id].session is session
-        assert data.removed == []
-        assert JobResult(job_id=20, success=False) not in _finished_results(manager)
-
-        manager._reap_dead_sessions()
-        assert manager._sessions == {}
-        assert manager._retiring_sessions == {}
-        assert data.removed == [session.peer_id]
-        assert (
-            _finished_results(manager).count(JobResult(job_id=20, success=False)) == 1
-        )
-        assert session.close_calls == 2
-
-    def test_reap_quarantines_load_until_session_proves_quiescence(self, monkeypatch):
-        class FakeData:
-            def __init__(self):
-                self.removed: list[str] = []
-
-            def remove_remote_peer(self, peer_id):
-                self.removed.append(peer_id)
-
-        manager = self._make()
-        data = FakeData()
-        manager._data = data  # type: ignore[assignment]
-        session = _FakeSession(
-            peer_id="dead:quarantine",
-            alive=False,
-            close_jobs=[73],
-            close_req_ids=["req-73"],
-            close_complete=False,
-        )
-        session._client._inbound[73] = object()
-        manager._sessions[session.peer_id] = session  # type: ignore[assignment]
-        warnings: list[str] = []
-        monkeypatch.setattr(
-            manager_module.logger,
-            "warning",
-            lambda message, *args: warnings.append(message % args),
-        )
-
-        manager._reap_dead_sessions()
-
-        assert manager._sessions == {}
-        assert manager._retiring_sessions[session.peer_id].session is session
-        assert JobResult(73, False) not in _finished_results(manager)
-        assert data.removed == []
-        assert len(warnings) == 1
-        assert "ZMQ disconnect is not NIXL quiescence" in warnings[0]
-        manager._reap_dead_sessions()
-        assert len(warnings) == 1
-
-    def test_reap_retries_peer_removal_after_session_detaches(self):
-        primary = _ConstructorFailure("peer removal")
-
-        class FakeData:
-            def __init__(self):
-                self.removed: list[str] = []
-
-            def remove_remote_peer(self, peer_id):
-                self.removed.append(peer_id)
-                if len(self.removed) == 1:
-                    raise primary
-
-        class DetachingSession(_FakeSession):
-            def close(self):
-                result = super().close()
-                self.connected = False
-                self.alive = False
-                return result
-
-        manager = self._make()
-        data = FakeData()
-        manager._data = data  # type: ignore[assignment]
-        failed_serve = MagicMock(spec=ReqContext)
-        session = DetachingSession(
-            peer_id="dead:1234",
-            alive=False,
-            connected=True,
-            close_jobs=[20],
-            close_req_ids=["req-load"],
-            close_stores=[10],
-            close_failed_serves=[failed_serve],
-        )
-        manager._sessions[session.peer_id] = session  # type: ignore[assignment]
-        manager._kv_to_session["req-store"] = session  # type: ignore[assignment]
-
-        with pytest.raises(_ConstructorFailure) as raised:
-            manager._reap_dead_sessions()
-
-        assert raised.value is primary
-        assert manager._sessions == {}
-        assert manager._kv_to_session == {}
-        retirement = manager._retiring_sessions[session.peer_id]
-        assert retirement.session is session
-        assert retirement.close_result is not None
-        assert retirement.peer_removed is False
-        assert JobResult(20, False) not in _finished_results(manager)
-        assert JobResult(10, False) not in _finished_results(manager)
-
-        manager._reap_dead_sessions()
-        assert manager._retiring_sessions == {}
-        assert data.removed == [session.peer_id, session.peer_id]
-        assert _finished_results(manager).count(JobResult(20, False)) == 1
-        assert _finished_results(manager).count(JobResult(10, False)) == 1
-        assert manager._failed_req_ids == {"req-load"}
-        assert manager._failed_serve_ctxs == [failed_serve]
-
-    def test_reap_publication_retry_is_exactly_once_per_sink(self):
-        req_failure = _ConstructorFailure("request publication")
-        serve_failure = _ConstructorFailure("serve publication")
-
-        class FakeData:
-            def remove_remote_peer(self, _peer_id):
-                pass
-
-        class FailFirstUpdate(set):
-            def __init__(self):
-                super().__init__()
-                self.failed = False
-
-            def update(self, values):
-                if not self.failed:
-                    self.failed = True
-                    raise req_failure
-                return super().update(values)
-
-        class FailAfterFirstAppend(list):
-            def __init__(self):
-                super().__init__()
-                self.failed = False
-
-            def append(self, value):
-                super().append(value)
-                if not self.failed:
-                    self.failed = True
-                    raise serve_failure
-
-        manager = self._make()
-        manager._data = FakeData()  # type: ignore[assignment]
-        manager._failed_req_ids = FailFirstUpdate()
-        manager._failed_serve_ctxs = FailAfterFirstAppend()
-        ctx_a = MagicMock(spec=ReqContext)
-        ctx_b = MagicMock(spec=ReqContext)
-        session = _FakeSession(
-            peer_id="dead:1234",
-            alive=False,
-            connected=True,
-            close_jobs=[20],
-            close_req_ids=["req-load"],
-            close_stores=[10],
-            close_failed_serves=[ctx_a, ctx_b],
-        )
-        manager._sessions[session.peer_id] = session  # type: ignore[assignment]
-
-        with pytest.raises(_ConstructorFailure) as first:
-            manager._reap_dead_sessions()
-        assert first.value is req_failure
-        assert _finished_results(manager).count(JobResult(20, False)) == 1
-        assert _finished_results(manager).count(JobResult(10, False)) == 1
-
-        with pytest.raises(_ConstructorFailure) as second:
-            manager._reap_dead_sessions()
-        assert second.value is serve_failure
-        assert _finished_results(manager).count(JobResult(20, False)) == 1
-        assert _finished_results(manager).count(JobResult(10, False)) == 1
-        assert list(manager._failed_serve_ctxs) == [ctx_a]
-
-        manager._reap_dead_sessions()
-        assert manager._retiring_sessions == {}
-        assert _finished_results(manager).count(JobResult(20, False)) == 1
-        assert _finished_results(manager).count(JobResult(10, False)) == 1
-        assert manager._failed_req_ids == {"req-load"}
-        assert list(manager._failed_serve_ctxs) == [ctx_a, ctx_b]
-        assert session.close_calls == 1
-
-    def test_reap_retains_store_pins_until_session_is_quiescent(self):
-        class FakeData:
-            def __init__(self):
-                self.removed: list[str] = []
-
-            def remove_remote_peer(self, peer_id):
-                self.removed.append(peer_id)
-
-        class DrainingSession(_FakeSession):
-            def __init__(self):
-                super().__init__(
-                    peer_id="dead:1234",
-                    alive=False,
-                    connected=True,
-                    close_stores=[10],
-                )
-                self.close_complete = False
-
-            def close(self):
-                result = super().close()
-                self.connected = False
-                if self.close_calls >= 2:
-                    self.close_complete = True
-                return result
-
-        manager = self._make()
-        data = FakeData()
-        manager._data = data  # type: ignore[assignment]
-        session = DrainingSession()
-        manager._sessions[session.peer_id] = session  # type: ignore[assignment]
-
-        manager._reap_dead_sessions()
-        assert manager._sessions == {}
-        assert manager._retiring_sessions[session.peer_id].session is session
-        assert data.removed == []
-        assert JobResult(10, False) not in _finished_results(manager)
-
-        manager._reap_dead_sessions()
-        assert manager._retiring_sessions == {}
-        assert data.removed == [session.peer_id]
-        assert _finished_results(manager).count(JobResult(10, False)) == 1
-        assert session.close_calls == 2
-
     def test_reap_fails_probes(self):
         """A reaped session's in-flight lookups land in _failed_req_ids so
         the consumer's lookup() returns MISS instead of RETRY forever."""
@@ -1194,9 +752,9 @@ class TestGetFinished:
         mgr = self._make()
         from vllm.v1.kv_offload.tiering.p2p.manager import _UnboundStoreBatch
 
-        mgr._unbound_stores["req-fresh"] = {
-            99: _UnboundStoreBatch(job_id=99, keys=[b"k"], block_ids=[0])
-        }
+        mgr._unbound_stores["req-fresh"] = [
+            _UnboundStoreBatch(job_id=99, keys=[b"k"], block_ids=[0])
+        ]
         list(mgr.get_finished_jobs())
         assert "req-fresh" in mgr._unbound_stores
 
@@ -1210,10 +768,10 @@ class TestGetFinished:
         stale = _UnboundStoreBatch(job_id=10, keys=[b"k"], block_ids=[0])
         # Backdate the submission so the head batch is past the deadline.
         stale.submitted_at = time.monotonic() - _UNBOUND_STORE_TIMEOUT_S - 1.0
-        mgr._unbound_stores["req-stale"] = {
-            10: stale,
-            11: _UnboundStoreBatch(job_id=11, keys=[b"k2"], block_ids=[1]),
-        }
+        mgr._unbound_stores["req-stale"] = [
+            stale,
+            _UnboundStoreBatch(job_id=11, keys=[b"k2"], block_ids=[1]),
+        ]
 
         results = list(mgr.get_finished_jobs())
 
@@ -1222,50 +780,6 @@ class TestGetFinished:
         assert JobResult(job_id=10, success=False) in results
         assert JobResult(job_id=11, success=False) in results
         assert "req-stale" in mgr._failed_req_ids
-
-    def test_unbound_timeout_publication_cut_replays_before_unlink(self, monkeypatch):
-        """A post-publication cut retains every authoritative batch."""
-        from vllm.v1.kv_offload.tiering.p2p.manager import _UnboundStoreBatch
-
-        primary = _ConstructorFailure("after result publication")
-
-        class InterruptingResults(dict):
-            interrupt = True
-
-            def setdefault(self, key, default=None):
-                result = super().setdefault(key, default)
-                if self.interrupt:
-                    self.interrupt = False
-                    raise primary
-                return result
-
-        mgr = _make_manager()
-        stale = _UnboundStoreBatch(job_id=10, keys=[b"k"], block_ids=[0])
-        stale.submitted_at = time.monotonic() - _UNBOUND_STORE_TIMEOUT_S - 1.0
-        second = _UnboundStoreBatch(job_id=11, keys=[b"k2"], block_ids=[1])
-        mgr._unbound_stores["req-cut"] = {10: stale, 11: second}
-        mgr._finished_jobs = InterruptingResults()
-        warnings: list[str] = []
-        monkeypatch.setattr(
-            manager_module.logger,
-            "warning",
-            lambda message, *args: warnings.append(message % args),
-        )
-
-        with pytest.raises(_ConstructorFailure) as raised:
-            mgr._reap_unbound_stores()
-        assert raised.value is primary
-        assert list(mgr._unbound_stores["req-cut"]) == [10, 11]
-        assert _finished_results(mgr) == [JobResult(10, False)]
-
-        mgr._reap_unbound_stores()
-        assert "req-cut" not in mgr._unbound_stores
-        assert _finished_results(mgr) == [
-            JobResult(10, False),
-            JobResult(11, False),
-        ]
-        assert "req-cut" in mgr._failed_req_ids
-        assert any("failing 2 job(s)" in warning for warning in warnings)
 
     def test_submit_store_parks_unbound_batch(self):
         """submit_store on an unbound id appends a batch with a fresh
@@ -1279,7 +793,7 @@ class TestGetFinished:
         after = time.monotonic()
         batches = mgr._unbound_stores["req-1"]
         assert len(batches) == 1
-        assert before <= batches[1].submitted_at <= after
+        assert before <= batches[0].submitted_at <= after
 
 
 # ---------------------------------------------------------------------------
@@ -1357,7 +871,9 @@ class _ShutdownFakeControl:
 
 
 class TestShutdownDrain:
-    """shutdown() drains with wait-mode or retains resources and raises."""
+    """shutdown() drains inflight transfers via cancel(mode='wait')
+    before calling _data.close(), with a 3s deadline fallback to
+    cancel(mode='immediate')."""
 
     def _prep(
         self,
@@ -1394,58 +910,16 @@ class TestShutdownDrain:
         assert data.close_calls == 1
         assert control.close_calls == 1
 
-    def test_shutdown_reconciles_lost_return_before_cancel_snapshot(self):
-        mgr, data, _ = self._prep()
-        session = _FakeSession(peer_id="peer:1", connected=True)
-        recovered_owner = object()
-        session._server.recover_on_reconcile[77] = recovered_owner
-        mgr._sessions["peer:1"] = session  # type: ignore[assignment]
-
-        mgr._drain_inflight_for_shutdown()
-
-        assert session._server.reconcile_calls == 1
-        assert session._server._inflight[77] is recovered_owner
-        assert data.cancel_calls == [([77], "wait")]
-
-    def test_shutdown_recovery_failure_retains_owner_before_snapshot(self):
-        mgr, data, _ = self._prep()
-        session = _FakeSession(peer_id="peer:1", connected=True)
-        recovery_error = _ConstructorFailure("ambiguous recovery")
-        session._server.reconcile_error = recovery_error
-        mgr._sessions["peer:1"] = session  # type: ignore[assignment]
-
-        with pytest.raises(_ConstructorFailure) as raised:
-            mgr._drain_inflight_for_shutdown()
-
-        assert raised.value is recovery_error
-        assert session._server.reconcile_calls == 1
-        assert data.cancel_calls == []
-
-    def test_shutdown_closes_control_and_preserves_first_drain_failure(self):
-        manager, data, control = self._prep()
-        first = _ConstructorFailure("drain")
-        control_error = _ConstructorFailure("control")
-        manager._drain_inflight_for_shutdown = MagicMock(side_effect=first)
-        control.close = MagicMock(side_effect=control_error)
-
-        with pytest.raises(_ConstructorFailure) as raised:
-            manager.shutdown()
-
-        assert raised.value is first
-        control.close.assert_called_once_with()
-        assert data.close_calls == 0
-
-    def test_shutdown_timeout_raises_and_retains_resources(self, monkeypatch):
+    def test_shutdown_force_cancels_after_timeout(self, monkeypatch):
         # Drain never completes — wait-cancel keeps returning the inflight set.
         # Use a synthetic clock so the test does not depend on real wallclock
         # being able to advance in <50ms on a loaded CI node:
         #   call 1 (deadline calc): 100.0  -> deadline = 100.05
         #   call 2 (loop predicate): 100.0 -> enters loop, one wait-cancel
-        #   call 3 (loop predicate): 100.06 -> exits and fails closed
+        #   call 3 (loop predicate): 100.06 -> exits, force-cancel runs
         monkeypatch.setattr(manager_module, "_SHUTDOWN_DRAIN_TIMEOUT_S", 0.05)
         monkeypatch.setattr(manager_module, "_DRAIN_SLEEP_S", 0.0)
-        # The final two values drive the successful retry below.
-        times = iter([100.0, 100.0, 100.06, 101.0, 101.0])
+        times = iter([100.0, 100.0, 100.06])
         # Patch via a fake module on `manager_module.time` so we do not mutate
         # the global `time` module — other code in the process (e.g. the
         # buildkite test collector's pytest_runtest_logreport hook) calls
@@ -1457,25 +931,15 @@ class TestShutdownDrain:
             still_queue=[[42]],
             inflight_ids=[42],
         )
-        with pytest.raises(RuntimeError, match="resources retained"):
-            mgr.shutdown()
+        mgr.shutdown()
 
         wait_calls = [c for c in data.cancel_calls if c[1] == "wait"]
         immediate_calls = [c for c in data.cancel_calls if c[1] == "immediate"]
         assert len(wait_calls) == 1
         assert wait_calls[0][0] == [42]
-        assert immediate_calls == []
-        assert "peer:1" in mgr._sessions
-        assert 42 in mgr._sessions["peer:1"]._server._inflight
-        assert data.close_calls == 0
-        assert control.close_calls == 1
-
-        # A later shutdown may retry after the transport proves quiescence.
-        data._still_queue = [[]]
-        mgr.shutdown()
-        assert mgr._sessions == {}
+        assert immediate_calls == [([42], "immediate")]
         assert data.close_calls == 1
-        assert control.close_calls == 2
+        assert control.close_calls == 1
 
     def test_shutdown_no_inflight_skips_drain(self):
         mgr, data, control = self._prep()
@@ -1591,7 +1055,6 @@ class _FakeData:
         self.num_blocks = 16
         self.config_fingerprint = ""
         self._remote_peers: dict[str, dict] = {}
-        self._removed_peers: list[str] = []
         self._inflight_done: list[int] = []
         self._next_id = 0
 
@@ -1609,7 +1072,6 @@ class _FakeData:
         }
 
     def remove_remote_peer(self, peer_id: str) -> None:
-        self._removed_peers.append(peer_id)
         self._remote_peers.pop(peer_id, None)
 
     def write_blocks(self, peer_id, local_idxs, remote_idxs):
@@ -1626,9 +1088,6 @@ class _FakeData:
         done = self._inflight_done[:]
         self._inflight_done.clear()
         return PollResult(done=done, failed=[])
-
-    def ack_completions(self, peer_id, transfer_ids) -> None:
-        del peer_id, transfer_ids
 
     def cancel(self, transfer_ids) -> None:
         pass
@@ -1735,12 +1194,6 @@ class TestBidirectionalManager:
             all_a.extend(list(mgr_a.get_finished_jobs()))
             all_b.extend(list(mgr_b.get_finished_jobs()))
 
-        session_a = mgr_a._sessions["B:2"]
-        session_b = mgr_b._sessions["A:1"]
-        assert session_a.ready and session_b.ready
-        assert session_a._remote_epoch == session_b._local_epoch
-        assert session_b._remote_epoch == session_a._local_epoch
-
         # Both load jobs and both store jobs must complete successfully.
         a_ok = {r.job_id for r in all_a if r.success}
         b_ok = {r.job_id for r in all_b if r.success}
@@ -1838,7 +1291,8 @@ class TestAcceptNewPeers:
 
 
 class TestPollOnce:
-    """_poll_once reaps before admission, then polls and reaps again."""
+    """_poll_once must drain control, accept new peers, poll every session,
+    surface results, and reap dead sessions — in that order."""
 
     def test_orchestrates_accept_poll_and_reap(self):
         mgr = _make_manager()
@@ -1871,24 +1325,17 @@ class TestPollOnce:
                 return []
 
         class _Data:
-            def __init__(self):
-                self.reap_calls = 0
-
             def remove_remote_peer(self_inner, pid):
                 pass
 
-            def reap_retired_peers(self_inner):
-                self_inner.reap_calls += 1
-
         mgr._control = _Ctrl()  # type: ignore[assignment]
-        data = _Data()
-        mgr._data = data  # type: ignore[assignment]
+        mgr._data = _Data()  # type: ignore[assignment]
 
         mgr._poll_once()
 
         # Every session was polled — alive's results landed.
         # Dead session was reaped — its close() failures landed.
-        finished = _finished_results(mgr)
+        finished = mgr._finished_jobs
         ok = {(r.job_id, r.success) for r in finished}
         assert (11, True) in ok  # alive load result
         assert (22, True) in ok  # alive store result
@@ -1897,109 +1344,6 @@ class TestPollOnce:
         assert "req-33" in mgr._failed_req_ids
         assert peer_dead not in mgr._sessions
         assert peer_alive in mgr._sessions
-        assert data.reap_calls == 1
-
-    def test_reaps_dead_same_peer_before_accepting_replacement(self, monkeypatch):
-        mgr = _make_manager()
-        peer_id = "10.0.0.3:9999"
-        old = _FakeSession(peer_id=peer_id, alive=False, connected=True)
-        mgr._sessions[peer_id] = old  # type: ignore[assignment]
-        incoming = _RecordingConn(peer_id)
-
-        class _Ctrl:
-            def poll(self):
-                return [incoming]
-
-        class _Data:
-            block_len = 4096
-
-            def __init__(self):
-                self.removed: list[str] = []
-
-            def remove_remote_peer(self, removed_peer_id):
-                self.removed.append(removed_peer_id)
-
-            def reap_retired_peers(self):
-                pass
-
-        replacements: list[_FakeSession] = []
-
-        def make_session(**kwargs):
-            replacement = _FakeSession(
-                peer_id=kwargs["peer_id"], alive=True, connected=True
-            )
-            replacements.append(replacement)
-            return replacement
-
-        mgr._control = _Ctrl()  # type: ignore[assignment]
-        data = _Data()
-        mgr._data = data  # type: ignore[assignment]
-        monkeypatch.setattr(manager_module, "P2PSession", make_session)
-
-        mgr._poll_once()
-
-        assert old.close_calls == 1
-        assert data.removed == [peer_id]
-        assert incoming.close_calls == 0
-        assert len(replacements) == 1
-        assert mgr._sessions[peer_id] is replacements[0]
-
-    def test_retried_replacement_is_accepted_after_quarantine_drains(self, monkeypatch):
-        mgr = _make_manager()
-        peer_id = "10.0.0.4:9999"
-        old = _FakeSession(
-            peer_id=peer_id,
-            alive=False,
-            connected=True,
-            close_complete=False,
-        )
-        mgr._sessions[peer_id] = old  # type: ignore[assignment]
-        attempts = [_RecordingConn(peer_id), _RecordingConn(peer_id)]
-
-        class _Ctrl:
-            def poll(self):
-                return [attempts.pop(0)]
-
-        class _Data:
-            block_len = 4096
-
-            def __init__(self):
-                self.removed: list[str] = []
-
-            def remove_remote_peer(self, removed_peer_id):
-                self.removed.append(removed_peer_id)
-
-            def reap_retired_peers(self):
-                pass
-
-        replacements: list[_FakeSession] = []
-
-        def make_session(**kwargs):
-            replacement = _FakeSession(
-                peer_id=kwargs["peer_id"], alive=True, connected=True
-            )
-            replacements.append(replacement)
-            return replacement
-
-        mgr._control = _Ctrl()  # type: ignore[assignment]
-        data = _Data()
-        mgr._data = data  # type: ignore[assignment]
-        monkeypatch.setattr(manager_module, "P2PSession", make_session)
-
-        first = attempts[0]
-        mgr._poll_once()
-        assert first.close_calls == 1
-        assert replacements == []
-        assert peer_id in mgr._retiring_sessions
-
-        old.close_complete = True
-        second = attempts[0]
-        mgr._poll_once()
-
-        assert second.close_calls == 0
-        assert data.removed == [peer_id]
-        assert len(replacements) == 1
-        assert mgr._sessions[peer_id] is replacements[0]
 
     def test_new_fetch_id_binds_and_replays_unbound_batches(self):
         """When session.poll() reports a kv_request_id whose FetchMsg
@@ -2016,10 +1360,10 @@ class TestPollOnce:
             new_fetch_ids=["req-1"],
         )
         mgr._sessions[peer] = sess  # type: ignore[assignment]
-        mgr._unbound_stores["req-1"] = {
-            5: _UnboundStoreBatch(job_id=5, keys=[b"k1"], block_ids=[0]),
-            6: _UnboundStoreBatch(job_id=6, keys=[b"k2"], block_ids=[1]),
-        }
+        mgr._unbound_stores["req-1"] = [
+            _UnboundStoreBatch(job_id=5, keys=[b"k1"], block_ids=[0]),
+            _UnboundStoreBatch(job_id=6, keys=[b"k2"], block_ids=[1]),
+        ]
 
         class _Ctrl:
             def poll(self_inner):
@@ -2035,68 +1379,6 @@ class TestPollOnce:
             for kv_req_id, keys, _, job_id in sess.stores_added
         ]
         assert replayed == [("req-1", [b"k1"], 5), ("req-1", [b"k2"], 6)]
-
-    def test_session_result_is_owned_before_pre_or_post_ack_cut(self):
-        for cut_after_ack in (False, True):
-            primary = _ConstructorFailure("ack interrupted")
-
-            class InterruptedAck(_FakeSession):
-                interrupt = True
-
-                def ack_results(
-                    self,
-                    *args,
-                    _cut_after_ack=cut_after_ack,
-                    _primary=primary,
-                ):
-                    if self.interrupt:
-                        self.interrupt = False
-                        if _cut_after_ack:
-                            super().ack_results(*args)
-                        raise _primary
-                    super().ack_results(*args)
-
-            mgr = _make_manager()
-            session = InterruptedAck(loads=[LoadResult(71, "req-71", True)])
-
-            with pytest.raises(_ConstructorFailure) as raised:
-                mgr._adopt_session_result(session, session.pending_results())
-            assert raised.value is primary
-            assert _finished_results(mgr) == [JobResult(71, True)]
-
-            mgr._adopt_session_result(session, session.pending_results())
-            assert _finished_results(mgr) == [JobResult(71, True)]
-            assert session.pending_results().loads == []
-
-    def test_fetch_replay_does_not_duplicate_session_owned_store(self):
-        from vllm.v1.kv_offload.tiering.p2p.manager import _UnboundStoreBatch
-
-        primary = _ConstructorFailure("after session adopted store")
-
-        class InterruptedStore(_FakeSession):
-            interrupt = True
-
-            def add_stored_blocks(self, *args):
-                super().add_stored_blocks(*args)
-                if self.interrupt:
-                    self.interrupt = False
-                    raise primary
-
-        mgr = _make_manager()
-        session = InterruptedStore(new_fetch_ids=["req-cut"])
-        batch = _UnboundStoreBatch(job_id=72, keys=[b"k"], block_ids=[0])
-        mgr._unbound_stores["req-cut"] = {72: batch}
-
-        with pytest.raises(_ConstructorFailure) as raised:
-            mgr._adopt_session_result(session, session.pending_results())
-        assert raised.value is primary
-        assert list(mgr._unbound_stores["req-cut"]) == [72]
-        assert len(session.stores_added) == 1
-
-        mgr._adopt_session_result(session, session.pending_results())
-        assert "req-cut" not in mgr._unbound_stores
-        assert len(session.stores_added) == 1
-        assert session.pending_results().new_fetch_ids == []
 
     def test_new_fetch_id_with_no_unbound_still_binds(self):
         """A FetchMsg for a kv_request_id with no parked batches still
@@ -2142,7 +1424,7 @@ class TestPollOnce:
 
         mgr._poll_once()
 
-        assert _finished_results(mgr) == [JobResult(job_id=5, success=False)]
+        assert mgr._finished_jobs == [JobResult(job_id=5, success=False)]
         assert "req-5" in mgr._failed_req_ids
 
 
@@ -2184,29 +1466,6 @@ class TestDrainJobs:
         mgr._sessions["peer:1"] = _FakeSession(peer_id="peer:1")  # type: ignore[assignment]
         # Should return on the first iteration.
         mgr.drain_jobs()
-
-    def test_retiring_session_destination_participates_in_drain(self, monkeypatch):
-        from vllm.v1.kv_offload.tiering.p2p.manager import _RetiringSession
-
-        mgr = _make_manager()
-        session = _FakeSession(peer_id="peer:retiring", close_complete=False)
-        session._client._inbound[1] = object()
-        mgr._retiring_sessions[session.peer_id] = _RetiringSession(session=session)
-        polls = 0
-
-        def poll_once():
-            nonlocal polls
-            polls += 1
-            if polls == 2:
-                session._client._inbound.clear()
-                mgr._retiring_sessions.clear()
-
-        mgr._poll_once = poll_once  # type: ignore[method-assign]
-        monkeypatch.setattr(manager_module.time, "sleep", lambda _: None)
-
-        mgr.drain_jobs()
-
-        assert polls == 2
 
     def test_logs_warning_after_5s_then_completes(self, monkeypatch):
         """A session that stays inflight past 5s triggers the warning, and
@@ -2271,7 +1530,7 @@ class TestOnScheduleEnd:
         raise and doesn't mutate state."""
         mgr = _make_manager()
         before_sessions = dict(mgr._sessions)
-        before_jobs = dict(mgr._finished_jobs)
+        before_jobs = list(mgr._finished_jobs)
         assert (
             mgr.on_schedule_end(
                 ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
@@ -2289,14 +1548,14 @@ class TestOnScheduleEnd:
 
 class TestConnectionDeathMidTransfer:
     """When a peer's control connection dies while a load is in flight,
-    the load and CPU destination remain quarantine-owned because control
-    death is not remote-DMA quiescence. The
+    the load surfaces as failed and its kv_request_id lands in
+    _failed_req_ids so future lookups route to local prefill. The
     prefiller-side store no longer travels through the session at store
     time (it's parked in _unbound_stores keyed by kv_request_id), so its
     cleanup on connection death is via on_request_finished or the
     unbound-store timeout — covered separately below."""
 
-    def test_dead_connection_with_pending_load_quarantines_destination(self):
+    def test_dead_connection_with_pending_work_surfaces_failures(self):
         mgr_a, mgr_b = _build_paired_managers()
 
         a_decoder_params = {
@@ -2341,23 +1600,18 @@ class TestConnectionDeathMidTransfer:
         assert sess._conn is not None
         sess._conn.mark_dead()
 
-        # ZMQ death does not prove the peer's NIXL writer quiescent. Reap
-        # therefore retains the load's session and CPU destination without a
-        # normal failed completion. Store 900 is independently unbound.
+        # Reap surfaces the load (which lived inside the session) as
+        # failed. The store 900 is not session-scoped — it survives the
+        # session reap and waits for the unbound-store timeout.
         results: list[JobResult] = []
         for _ in range(3):
             results.extend(list(mgr_a.get_finished_jobs()))
 
         outcomes = {(r.job_id, r.success) for r in results}
-        assert (901, False) not in outcomes
-        assert peer_id in mgr_a._retiring_sessions
-        assert mgr_a._retiring_sessions[peer_id].session is sess
-        assert sess.close_complete is False
-        assert sess._client.has_active_loads is True
-        assert peer_id not in mgr_a._data._removed_peers
+        assert (901, False) in outcomes, f"load should fail: {outcomes}"
         assert (900, False) not in outcomes, f"store should still be parked: {outcomes}"
         assert "req-load" in mgr_a._failed_req_ids
-        # Session left live routing but remains quarantine-owned.
+        # Session removed.
         assert peer_id not in mgr_a._sessions
         # Store batch is still parked.
         assert "req-store" in mgr_a._unbound_stores
@@ -2367,7 +1621,7 @@ class TestConnectionDeathMidTransfer:
         # evict unbound stores; only `_reap_unbound_stores` does, after
         # the unbound-store timeout. Job 900 stays unfinished here.
         mgr_a.on_request_finished(_req_context(a_prefiller_params))
-        finishes = {(r.job_id, r.success) for r in _finished_results(mgr_a)}
+        finishes = {(r.job_id, r.success) for r in mgr_a._finished_jobs}
         assert (900, False) not in finishes
         assert (900, True) not in finishes
         assert "req-store" in mgr_a._unbound_stores
@@ -2405,15 +1659,7 @@ class TestBindHostPortDefaults:
             manager_module,
             "NixlTransport",
             lambda agent_name, *a, **k: (
-                calls.update(nixl_name=agent_name, data_kwargs=k) or SimpleNamespace()
-            ),
-        )
-        monkeypatch.setattr(
-            manager_module,
-            "TorchTransferTransport",
-            lambda agent_name, *a, **k: (
-                calls.update(torch_name=agent_name, data_kwargs=k)
-                or SimpleNamespace(available=True)
+                calls.update(nixl_name=agent_name) or SimpleNamespace()
             ),
         )
         monkeypatch.setattr(
@@ -2493,59 +1739,3 @@ class TestBindHostPortDefaults:
         mgr_b = self._construct(monkeypatch, host="localhost", port=5710)
         assert mgr_a._local_id == mgr_b._local_id == "localhost:5710"
         assert mgr_a._nixl_agent_name != mgr_b._nixl_agent_name
-
-    def test_torch_data_transport_is_explicitly_selectable(self, monkeypatch):
-        mgr = self._construct(
-            monkeypatch,
-            data_transport="torch",
-            transfer_backend="reference",
-            transfer_progress_mode="background",
-            transfer_thread_mode="single",
-            transfer_options={"provider_option": "value"},
-        )
-
-        assert "nixl_name" not in mgr._test_calls
-        assert uuid.UUID(mgr._test_calls["torch_name"]).version == 4
-        assert mgr._test_calls["data_kwargs"]["backend"] == "reference"
-        assert mgr._test_calls["data_kwargs"]["endpoint_id"] == mgr._local_id
-        assert mgr._test_calls["data_kwargs"]["progress_mode"] == "background"
-        assert mgr._test_calls["data_kwargs"]["thread_mode"] == "single"
-        assert mgr._test_calls["data_kwargs"]["options"] == {"provider_option": "value"}
-
-    def test_torch_nixl_inherits_native_ucx_agent_options(self, monkeypatch):
-        mgr = self._construct(
-            monkeypatch,
-            data_transport="torch",
-            num_threads=7,
-        )
-
-        assert mgr._test_calls["data_kwargs"]["progress_mode"] == "background"
-        assert mgr._test_calls["data_kwargs"]["thread_mode"] == "single"
-        assert mgr._test_calls["data_kwargs"]["options"] == {
-            "backends": ["UCX"],
-            "num_threads": 7,
-            "capture_telemetry": True,
-        }
-
-    def test_explicit_torch_nixl_options_override_inherited_defaults(self, monkeypatch):
-        mgr = self._construct(
-            monkeypatch,
-            data_transport="torch",
-            backends=["UCX"],
-            num_threads=7,
-            transfer_options={
-                "backends": ["UCX"],
-                "num_threads": 2,
-                "capture_telemetry": False,
-            },
-        )
-
-        assert mgr._test_calls["data_kwargs"]["options"] == {
-            "backends": ["UCX"],
-            "num_threads": 2,
-            "capture_telemetry": False,
-        }
-
-    def test_unknown_data_transport_is_rejected(self, monkeypatch):
-        with pytest.raises(ValueError, match="data_transport"):
-            self._construct(monkeypatch, data_transport="unknown")

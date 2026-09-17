@@ -44,9 +44,6 @@ _CANCEL_DRAIN_TIMEOUT_S = 10.0
 # primary write or a just-started promotion typically completes; short
 # enough that the consumer doesn't sit idle on a stuck producer.
 _LOOKUP_PENDING_TIMEOUT_S = 5.0
-# Local-only owner for PD supply that arrived before its FetchMsg exposed the
-# peer's session-global operation token. Negative values are invalid on wire.
-_UNBOUND_PD_ROUND = -1
 
 
 class StoreResult(NamedTuple):
@@ -86,10 +83,6 @@ class _OutboundRequestState:
         default_factory=dict
     )  # key → remote_block_idx: blocks peer wants, awaiting supply
     remaining: int = 0  # blocks that need to be transferred to client
-    total_blocks: int = 0
-    # Successful terminal transfer IDs are the authoritative decrement facts.
-    # ``remaining`` is derived from this map after an interruption.
-    completed_blocks_by_tid: dict[int, int] = field(default_factory=dict)
     finishing: bool = False  # Signal finish request ASAP
     inflight: int = 0  # transfers submitted for this round, not yet polled
     # Job IDs that submit_store'd blocks for this round and have not
@@ -97,13 +90,6 @@ class _OutboundRequestState:
     # this set; poll-done and poll-failed discard entries as their
     # StoreResults fire.
     pending_job_ids: set[int] = field(default_factory=set)
-    # A failed round is a tombstone: it never submits more DMA. The
-    # failure journal drains every already-submitted transfer before
-    # publishing the remaining StoreResults or the wire terminal.
-    failed: bool = False
-    failure_settled: bool = False
-    failure_sent: bool = False
-    failure_send_done: bool = True
 
     def add_stored_blocks(
         self,
@@ -135,7 +121,6 @@ class _OutboundRequestState:
     ) -> _MatchResult:
         """Register the peer's fetch demand. Returns matched pairs."""
         self.demand_received = True
-        self.total_blocks = len(keys)
         self.remaining = len(keys)
 
         local_idxs: list[int] = []
@@ -170,28 +155,6 @@ class _InflightXfer:
     # Dummy default for test-seeded entries.
     round: _OutboundRequestState = field(default_factory=_OutboundRequestState)
     round_key: int = 0
-
-
-@dataclass
-class _TerminalTransfer:
-    """Session adoption receipt for one replayable transport terminal."""
-
-    xfer: _InflightXfer
-    outcome: str
-    applied: bool = False
-
-
-@dataclass
-class _FinalizingRound:
-    """Strong owner across result publication, wire send, and unlink."""
-
-    round: _OutboundRequestState
-    success: bool
-    send_done: bool
-    job_ids: frozenset[int]
-    results_published: bool = False
-    message_sent: bool = False
-    unlinked: bool = False
 
 
 @dataclass
@@ -250,9 +213,9 @@ class _ServerRequestState:
     is idle — see ``ServerRole._maybe_prune``.
     """
 
-    # Fetch rounds keyed by wire round_seq. PD supply received before Fetch is
-    # held under the local-only _UNBOUND_PD_ROUND owner, then rebound to the
-    # peer's token. A round is removed at terminal/failure/abort.
+    # Fetch rounds keyed by wire round_seq. A round is created by its
+    # first supply or its fetch and removed at its terminal (finalize /
+    # failure / abort).
     outbound: dict[int, _OutboundRequestState] = field(default_factory=dict)
     # Raw inbound LookupMsgs not yet processed against the ParentManager.
     pending_lookups: list[_PendingLookup] = field(default_factory=list)
@@ -279,31 +242,11 @@ class ServerRole:
         self,
         peer_id: str,
         transport: DataTransport,
-        send: Callable[[dict], bool | None],
+        send: Callable[[dict], None],
     ) -> None:
         self._peer_id = peer_id
         self._transport = transport
         self._send = send
-        owned_submit = getattr(transport, "write_blocks_owned", None)
-        if callable(owned_submit):
-            # Cache the bound method once: production submits pay no repeated
-            # feature lookup or compatibility branch.
-            self._submit_blocks_owned = owned_submit
-        else:
-
-            def legacy_submit(
-                target_peer: str,
-                local_idxs: list[int],
-                remote_idxs: list[int],
-                *,
-                recovery_token: object,
-            ) -> int | None:
-                del recovery_token
-                # Resolve dynamically so test/legacy transports that replace
-                # their old entry point retain the historical behavior.
-                return transport.write_blocks(target_peer, local_idxs, remote_idxs)
-
-            self._submit_blocks_owned = legacy_submit
 
         # All per-kv_request_id state lives here. Entries are created
         # lazily and dropped by _maybe_prune once every field is idle.
@@ -315,22 +258,11 @@ class ServerRole:
         # transfer_id → xfer. Mutate ONLY via _inflight_add / _inflight_pop
         # so the per-request inflight_tids stays in sync.
         self._inflight: dict[int, _InflightXfer] = {}
-        self._terminal_transfers: dict[int, _TerminalTransfer] = {}
-        # Commit-last owner for the one transfer whose transport return has
-        # not yet been durably adopted into the session graph.
-        self._submitting_xfer: _InflightXfer | None = None
         self._store_jobs: dict[int, float] = {}  # job_id → submitted_at
-        # Jobs whose deadline expired but whose source memory must remain
-        # pinned until every transfer in their failed round is quiescent.
-        self._timed_out_store_jobs: set[int] = set()
-        # Cold-path failure journal. An entry remains until wait-mode
-        # cancellation has released every sibling transfer and any required
-        # TransferDone failure has been emitted. The failed round itself may
-        # remain in ``outbound`` as a tombstone for a late FetchMsg.
-        self._failed_rounds: dict[tuple[str, int], _OutboundRequestState] = {}
-        # A result remains here until P2PSession acknowledges adoption.
-        self._pending_store_results: dict[int, StoreResult] = {}
-        self._finalizing_rounds: dict[tuple[str, int], _FinalizingRound] = {}
+        # StoreResults queued by _finalize_outbound for the next poll
+        # tick to surface. Mirrors the deferred-result pattern used for
+        # load timeouts.
+        self._pending_store_results: list[StoreResult] = []
         # Synthetic lookup ctxs whose ``on_request_finished`` still needs to
         # fire but which were closed outside a serve window (FetchMsg / local
         # finish popped their parked lookup). Drained via
@@ -340,18 +272,6 @@ class ServerRole:
         # Parked aborts awaiting drain, keyed by (kv_request_id, round)
         # with the abort start time.
         self._pending_aborts: dict[tuple[str, int], float] = {}
-        self._abort_timeout_warned: set[tuple[str, int]] = set()
-        # Round identities whose local DMA drain was proven. Retaining this
-        # tombstone makes AbortAck replay safe after a lost return or duplicate.
-        self._abort_ack_intents: set[tuple[str, int]] = set()
-        # One durable close journal publishes results and the exact cancel set
-        # in a single assignment before any state is cleared or native code is
-        # entered. Unknown transfer IDs are idempotent in DataTransport.cancel,
-        # so retrying this set is safe after an outcome-ambiguous interruption.
-        self._close_journal: (
-            tuple[list[int], list[ReqContext], tuple[int, ...]] | None
-        ) = None
-        self._close_complete = False
 
     # ------------------------------------------------------------------
     # State helpers
@@ -375,10 +295,6 @@ class ServerRole:
             and not st.lookups
             and not st.pending_lookups
             and not any(kv == kv_request_id for kv, _ in self._pending_aborts)
-            and (
-                self._submitting_xfer is None
-                or self._submitting_xfer.kv_request_id != kv_request_id
-            )
         ):
             del self._requests[kv_request_id]
 
@@ -392,60 +308,18 @@ class ServerRole:
         keys: Sequence[OffloadKey],
         block_ids: Sequence[int],
         job_id: JobId,
-        round_seq: int | None = None,
+        round_seq: int = 0,
         *,
         from_lookup: bool = False,
     ) -> None:
         """New blocks stored locally — match within their fetch round.
 
-        Lookup pins carry their explicit operation token. A PD submit_store has
-        no token in the manager API: it binds to the unique matching demanded
-        round, or remains under a local unbound owner until Fetch supplies one.
+        Lookup pins carry the round they were probed under; PD
+        submit_store batches share PD's single round 0.
         """
-        self._reconcile_and_drain_submitting_transfer()
-        st = self._get_or_create_request(kv_request_id)
-        if round_seq is None:
-            matched_round: int | None = None
-            sole_round: int | None = None
-            round_count = 0
-            for candidate_seq, candidate in st.outbound.items():
-                if candidate_seq == _UNBOUND_PD_ROUND or candidate.lookup_supplied:
-                    continue
-                round_count += 1
-                sole_round = candidate_seq
-                if any(key in candidate.demanded for key in keys):
-                    if matched_round is not None and matched_round != candidate_seq:
-                        raise RuntimeError(
-                            "PD store batch matches multiple fetch generations"
-                        )
-                    matched_round = candidate_seq
-            if matched_round is not None:
-                round_seq = matched_round
-            elif round_count == 1:
-                round_seq = sole_round
-            elif round_count > 1:
-                raise RuntimeError(
-                    "PD store batch has ambiguous fetch-generation ownership"
-                )
-            else:
-                round_seq = _UNBOUND_PD_ROUND
-        assert round_seq is not None
-        rnd = st.outbound.get(round_seq)
-        if rnd is not None and rnd.failed:
-            # A prior timeout/failure may already have released older source
-            # slots. Keep the round as a tombstone so a late producer batch
-            # cannot resurrect it and DMA from recycled memory.
-            self._publish_store_result(job_id, False, rnd)
-            logger.warning(
-                "P2PSession %s: rejecting store job %d for failed "
-                "kv_request_id=%s round=%s",
-                self._peer_id,
-                job_id,
-                kv_request_id,
-                round_seq,
-            )
-            return
         self._store_jobs[job_id] = time.monotonic()
+        st = self._get_or_create_request(kv_request_id)
+        rnd = st.outbound.get(round_seq)
         if rnd is None:
             rnd = st.outbound[round_seq] = _OutboundRequestState()
         if from_lookup:
@@ -453,10 +327,6 @@ class ServerRole:
         result = rnd.add_stored_blocks(keys, block_ids, job_id)
         if result.local_idxs and rnd.demand_received:
             self._submit_transfer(kv_request_id, result, rnd, round_seq)
-
-    def owns_store_job(self, job_id: JobId) -> bool:
-        """Whether this role still owns or has journaled ``job_id``."""
-        return job_id in self._store_jobs or job_id in self._pending_store_results
 
     def on_fetch(
         self,
@@ -474,7 +344,6 @@ class ServerRole:
         a round already holding demand raises ValueError
         (protocol-error disconnect).
         """
-        self._reconcile_and_drain_submitting_transfer()
         logger.debug(
             "P2PSession %s: fetch RECEIVED kv_request_id=%s round=%s blocks=%d",
             self._peer_id,
@@ -491,39 +360,14 @@ class ServerRole:
         st = self._get_or_create_request(kv_request_id)
         req = st.outbound.get(round_seq)
         if req is None:
-            # PD supply can precede Fetch and therefore cannot know the peer's
-            # session-global token. Publish the wire-key owner before removing
-            # its local placeholder so an interrupted re-entry converges.
-            req = st.outbound.get(_UNBOUND_PD_ROUND)
-            if req is None:
-                req = _OutboundRequestState()
-            st.outbound[round_seq] = req
-        unbound = st.outbound.get(_UNBOUND_PD_ROUND)
-        if unbound is not None and unbound is req:
-            st.outbound.pop(_UNBOUND_PD_ROUND, None)
+            req = st.outbound[round_seq] = _OutboundRequestState()
         result = req.add_fetch_demand(keys, block_indexes)
         if not keys:
             # Terminal empty fetch: close the lookup phase and drain
             # every round with no TransferDoneMsg (nothing waits on it).
             self._finish_inbound_lookups(kv_request_id)
-            for key, active_round in list(st.outbound.items()):
-                if active_round.inflight or active_round.failed:
-                    self._mark_round_failed(
-                        kv_request_id,
-                        key,
-                        active_round,
-                        send_done=False,
-                    )
-                else:
-                    self._finalize_outbound(kv_request_id, key, send_done=False)
-            self._drain_failed_rounds()
-            return
-        if req.failed:
-            # The tombstone may predate demand. Record that a terminal is now
-            # owed, but let the failure journal send it only after all prior
-            # DMA for this round is known quiescent.
-            req.demanded.clear()
-            self._failed_rounds[(kv_request_id, round_seq)] = req
+            for key in list(st.outbound):
+                self._finalize_outbound(kv_request_id, key, send_done=False)
             return
         if req.lookup_supplied and req.demanded:
             # A symmetric round's supply always precedes its fetch, so
@@ -552,21 +396,6 @@ class ServerRole:
 
     def on_abort_fetch(self, kv_request_id: str, round_seq: int = 0) -> None:
         """Handle an AbortFetchMsg from the peer, cancelling one round."""
-        self._reconcile_and_drain_submitting_transfer()
-        abort_key = (kv_request_id, round_seq)
-        if abort_key in self._abort_ack_intents:
-            accepted = self._send(
-                {
-                    TYPE_KEY: AbortAckMsg.TYPE,
-                    AbortAckMsg.KV_REQUEST_ID: kv_request_id,
-                    AbortAckMsg.ROUND_SEQ: round_seq,
-                }
-            )
-            if accepted is not False:
-                self._pending_aborts.pop(abort_key, None)
-                self._abort_timeout_warned.discard(abort_key)
-                self._maybe_prune(kv_request_id)
-            return
         # Abort for an unknown id may be a benign race/duplicate or a
         # real protocol violation; we don't track completed ids, so warn.
         st = self._requests.get(kv_request_id)
@@ -830,7 +659,6 @@ class ServerRole:
                     LookupRespMsg.KV_REQUEST_ID: lookup.kv_request_id,
                     LookupRespMsg.KEYS: list(lookup.keys),
                     LookupRespMsg.HITS: hits,
-                    LookupRespMsg.ROUND_SEQ: lookup.round_seq,
                 }
             )
         parent.on_request_finished(lookup.ctx)
@@ -887,7 +715,6 @@ class ServerRole:
         If inflight transfers exist for this id, defer — the last
         completing transfer in collect_results will fire the message.
         """
-        self._reconcile_and_drain_submitting_transfer()
         self._finish_inbound_lookups(kv_request_id)
 
         st = self._requests.get(kv_request_id)
@@ -895,9 +722,6 @@ class ServerRole:
             return
         for key, req in list(st.outbound.items()):
             req.finishing = True
-            if req.failed:
-                self._failed_rounds[(kv_request_id, key)] = req
-                continue
             if not req.demand_received or req.inflight:
                 # No demand yet (prefiller-first): on_fetch finalizes via
                 # `finishing`. Inflight: the last completion finalizes.
@@ -911,38 +735,100 @@ class ServerRole:
         RETRY keys) is NOT done here — it runs in
         ``serve_external_requests`` where the ParentManager is available.
         """
-        self._reconcile_and_drain_submitting_transfer()
-        if self._finalizing_rounds:
-            self._resume_finalizing_rounds()
-        self._timeout_pending_store_jobs()
+        results: list[StoreResult] = self._timeout_pending_store_jobs()
+
+        if self._pending_store_results:
+            results.extend(self._pending_store_results)
+            self._pending_store_results.clear()
+
         # Scope the poll to this peer: the transport is shared across all peer
         # sessions of the engine, and poll() drains completed handles. An
         # unscoped poll here would consume sibling sessions' completions and
         # report them as "unknown transfer_id", starving those sessions.
         poll_result = self._transport.poll(self._peer_id)
 
-        # Failure dominates success for a round. Publish every transport
-        # terminal receipt before changing session ownership; replay after any
-        # cut therefore sees the same xfer and outcome.
-        for tid in poll_result.failed:
-            xfer = self._inflight.get(tid)
-            if xfer is not None:
-                self._mark_round_failed(
-                    xfer.kv_request_id,
-                    xfer.round_key,
-                    xfer.round,
+        for tid in poll_result.done:
+            xfer = self._inflight_pop(tid)
+            if xfer is None:
+                # Bug signal: transport reported a transfer we have no
+                # bookkeeping for. Likely a double-completion in the
+                # transport or a stale removal in the session. The
+                # attached job(s) still live in _store_jobs and will be
+                # surfaced as failures by _timeout_pending_store_jobs
+                # after _STORE_TIMEOUT_S, but log loudly so the
+                # underlying bug is findable.
+                logger.error(
+                    "P2PSession %s: transport reported done for unknown "
+                    "transfer_id=%d; attached job(s) will fail via "
+                    "store-timeout instead of completing now",
+                    self._peer_id,
+                    tid,
                 )
-        for outcome, transfer_ids in (
-            ("done", poll_result.done),
-            ("failed", poll_result.failed),
-        ):
-            for tid in transfer_ids:
-                self._adopt_transport_terminal(tid, outcome)
-        self._drain_terminal_transfers()
+                continue
+            results.extend(self._settle_xfer_jobs(xfer, success=True))
+            rnd = xfer.round
+            st = self._requests.get(xfer.kv_request_id)
+            if st is not None and st.outbound.get(xfer.round_key) is rnd:
+                rnd.remaining -= xfer.block_count
+                assert rnd.remaining >= 0, (
+                    f"remaining went negative for kv_request_id={xfer.kv_request_id}"
+                )
+                if rnd.remaining == 0:
+                    self._finalize_outbound(
+                        xfer.kv_request_id, xfer.round_key, success=True
+                    )
+                elif rnd.finishing and rnd.inflight == 0:
+                    self._finalize_outbound(
+                        xfer.kv_request_id, xfer.round_key, success=False
+                    )
+            self._maybe_prune(xfer.kv_request_id)
 
-        if self._failed_rounds:
-            self._drain_failed_rounds()
-        return list(self._pending_store_results.values())
+        failed_rounds: list[tuple[str, _OutboundRequestState]] | None = None
+        for tid in poll_result.failed:
+            xfer = self._inflight_pop(tid)
+            if xfer is None:
+                # See the matching error log in the done branch above.
+                logger.error(
+                    "P2PSession %s: transport reported failed for unknown "
+                    "transfer_id=%d; attached job(s) will fail via "
+                    "store-timeout instead of completing now",
+                    self._peer_id,
+                    tid,
+                )
+                continue
+            results.extend(self._settle_xfer_jobs(xfer, success=False))
+            rnd = xfer.round
+            st = self._requests.get(xfer.kv_request_id)
+            if st is not None and st.outbound.get(xfer.round_key) is rnd:
+                del st.outbound[xfer.round_key]
+                if failed_rounds is None:
+                    failed_rounds = []
+                failed_rounds.append((xfer.kv_request_id, rnd))
+                self._send(
+                    {
+                        TYPE_KEY: TransferDoneMsg.TYPE,
+                        TransferDoneMsg.KV_REQUEST_ID: xfer.kv_request_id,
+                        TransferDoneMsg.SUCCESS: False,
+                        TransferDoneMsg.ROUND_SEQ: xfer.round_key,
+                    }
+                )
+            self._maybe_prune(xfer.kv_request_id)
+
+        # Cancel each failed round's other inflight and fail its
+        # remaining store jobs — nothing else will settle them.
+        if failed_rounds:
+            for kv_request_id, rnd in failed_rounds:
+                ids_to_cancel = [
+                    tid for tid, x in self._inflight.items() if x.round is rnd
+                ]
+                for tid in ids_to_cancel:
+                    self._inflight_pop(tid)
+                if ids_to_cancel:
+                    self._transport.cancel(ids_to_cancel)
+                results.extend(self._fail_round_jobs(rnd))
+                self._maybe_prune(kv_request_id)
+
+        return results
 
     def collect_idle_timeouts(self) -> list[StoreResult]:
         """Run only the store-job timeout sweep.
@@ -951,24 +837,10 @@ class ServerRole:
         cannot have inflight transfers (no peer registered yet), so we
         skip the transport poll and the deferred-result drain.
         """
-        self._reconcile_and_drain_submitting_transfer()
-        if self._finalizing_rounds:
-            self._resume_finalizing_rounds()
-        self._timeout_pending_store_jobs()
-        return list(self._pending_store_results.values())
-
-    def ack_results(self, job_ids: Sequence[int]) -> None:
-        """Release results already adopted by P2PSession."""
-        for job_id in job_ids:
-            if type(job_id) is not int:
-                raise TypeError("job_id must be an exact int")
-            self._pending_store_results.pop(job_id, None)
-        for finalizer_key in tuple(self._finalizing_rounds):
-            self._maybe_retire_finalizer(finalizer_key)
+        return self._timeout_pending_store_jobs()
 
     def drain_pending_aborts(self) -> None:
         """Re-attempt every parked abort once per poll tick."""
-        self._reconcile_and_drain_submitting_transfer()
         for kv_request_id, round_seq in list(self._pending_aborts):
             self._drain_abort(kv_request_id, round_seq)
 
@@ -981,67 +853,30 @@ class ServerRole:
         parent handle in hand, so the manager flushes these in its next
         ``serve_external_requests``.
         """
-        # Close's own cancellation journal must see every recovered ID before
-        # any failed result can be published.
-        self._reconcile_submitting_transfer()
-        self._drain_terminal_transfers()
-        if self._close_journal is None:
-            failed_stores = list(self._store_jobs.keys())
-            # Surface every synthetic ctx still owing on_request_finished so
-            # the manager can release the TieringManager's per-request
-            # bookkeeping: parked lookups plus any already queued from a
-            # FetchMsg / finish that closed them before this teardown.
-            failed_serves = [
-                lu.ctx for st in self._requests.values() for lu in st.lookups.values()
-            ]
-            failed_serves.extend(self._finished_lookup_ctxs)
-            self._close_journal = (
-                failed_stores,
-                failed_serves,
-                tuple(self._inflight),
-            )
-
-        failed_stores, failed_serves, cancel_ids = self._close_journal
-        still_inflight = (
-            self._transport.cancel(cancel_ids, mode="wait") if cancel_ids else []
-        )
-        # Publish the narrowed retry set before examining it. If cancellation
-        # committed but an asynchronous exception arrived before this
-        # assignment, retrying the original IDs remains safe by contract.
-        self._close_journal = (
-            failed_stores,
-            failed_serves,
-            tuple(still_inflight),
-        )
-        if still_inflight:
-            return failed_stores, failed_serves
-
+        failed_stores = list(self._store_jobs.keys())
         self._store_jobs.clear()
-        self._timed_out_store_jobs.clear()
+        if self._inflight:
+            self._transport.cancel(list(self._inflight.keys()))
         self._inflight.clear()
-        self._failed_rounds.clear()
+        self._pending_store_results.clear()
+        # Surface every synthetic ctx still owing on_request_finished so
+        # the manager can release the TieringManager's per-request
+        # bookkeeping: parked lookups plus any already queued from a
+        # FetchMsg / finish that closed them before this teardown.
+        failed_serves = [
+            lu.ctx for st in self._requests.values() for lu in st.lookups.values()
+        ]
+        failed_serves.extend(self._finished_lookup_ctxs)
         self._requests.clear()
         self._serve_pending.clear()
         self._pending_aborts.clear()
-        self._abort_timeout_warned.clear()
-        self._abort_ack_intents.clear()
         self._finished_lookup_ctxs.clear()
-        self._close_complete = True
         return failed_stores, failed_serves
-
-    @property
-    def close_complete(self) -> bool:
-        """True only after every transport transfer is quiescent."""
-        return self._close_complete
 
     @property
     def has_inflight_transfers(self) -> bool:
         """True if any outbound store transfer is still in flight."""
-        return (
-            bool(self._inflight)
-            or bool(self._terminal_transfers)
-            or self._submitting_xfer is not None
-        )
+        return bool(self._inflight)
 
     # ------------------------------------------------------------------
     # Internal — inflight bookkeeping
@@ -1049,106 +884,12 @@ class ServerRole:
 
     def _has_inflight_for(self, kv_request_id: str) -> bool:
         st = self._requests.get(kv_request_id)
-        guarded = self._submitting_xfer
-        return (st is not None and bool(st.inflight_tids)) or (
-            guarded is not None and guarded.kv_request_id == kv_request_id
-        )
+        return st is not None and bool(st.inflight_tids)
 
     def _inflight_add(self, tid: int, xfer: _InflightXfer) -> None:
         """Insert an inflight transfer and record it on the request."""
-        if type(tid) is not int:
-            raise TypeError("transport transfer_id must be an exact int")
-        if tid in self._inflight and self._inflight[tid] is not xfer:
-            raise RuntimeError(f"duplicate transport transfer_id: {tid}")
         self._inflight[tid] = xfer
         self._get_or_create_request(xfer.kv_request_id).inflight_tids.add(tid)
-
-    def reconcile_submitting_transfer(self) -> None:
-        """Recover an interrupted transport return without releasing pins.
-
-        This deliberately does not drain the resulting failed-round journal:
-        manager shutdown needs the recovered primary IDs for its own bounded
-        cancellation snapshot. Normal session entry points use the private
-        reconcile-and-drain wrapper below.
-        """
-        self._reconcile_submitting_transfer()
-
-    def _reconcile_and_drain_submitting_transfer(self) -> None:
-        self._reconcile_submitting_transfer()
-        if self._failed_rounds:
-            self._drain_failed_rounds()
-
-    def _reconcile_submitting_transfer(self) -> None:
-        """Finish or conservatively fail the commit-last submit transaction.
-
-        ``_submitting_xfer`` is the exact identity token shared with the data
-        transport. The primary session map is authoritative; its request set
-        and round counter are reconstructed derivatives. A missing transport
-        recovery hook, ambiguous ownership, invalid ID, or collision raises
-        while leaving the guard and every source pin intact.
-        """
-        xfer = self._submitting_xfer
-        if xfer is None:
-            return
-
-        session_matches = [
-            tid for tid, candidate in self._inflight.items() if candidate is xfer
-        ]
-        if len(session_matches) > 1:
-            raise RuntimeError("submission guard has multiple session transfer IDs")
-
-        if session_matches:
-            transfer_id: int | None = session_matches[0]
-        else:
-            recover = getattr(self._transport, "recover_transfer_id", None)
-            if not callable(recover):
-                raise RuntimeError(
-                    "data transport does not support transfer return recovery"
-                )
-            transfer_id = recover(self._peer_id, xfer)
-
-        if transfer_id is not None and type(transfer_id) is not int:
-            raise TypeError("recovered transport transfer_id must be an exact int")
-        if transfer_id is not None:
-            existing = self._inflight.get(transfer_id)
-            if existing is not None and existing is not xfer:
-                raise RuntimeError(
-                    f"recovered transport transfer_id collision: {transfer_id}"
-                )
-            # Publish/repair the authoritative owner before any derived state.
-            self._inflight[transfer_id] = xfer
-
-        st = self._get_or_create_request(xfer.kv_request_id)
-        round_owner = st.outbound.get(xfer.round_key)
-        if round_owner is None:
-            st.outbound[xfer.round_key] = xfer.round
-        elif round_owner is not xfer.round:
-            raise RuntimeError(
-                "submission guard conflicts with outbound round owner: "
-                f"kv_request_id={xfer.kv_request_id} round={xfer.round_key}"
-            )
-
-        # These two structures are indexes, not independent ownership. Rebuild
-        # them from the primary map so every interrupted adoption cut converges.
-        st.inflight_tids = {
-            tid
-            for tid, candidate in self._inflight.items()
-            if candidate.kv_request_id == xfer.kv_request_id
-        }
-        xfer.round.inflight = sum(
-            candidate.round is xfer.round for candidate in self._inflight.values()
-        )
-
-        # An interrupted attempt is failed conservatively even when its request
-        # was recovered: wait-cancel must prove quiescence before source reuse.
-        self._mark_round_failed(
-            xfer.kv_request_id,
-            xfer.round_key,
-            xfer.round,
-        )
-        # Commit last. Any BaseException before this store leaves a retryable,
-        # strongly owned token and therefore cannot expose source memory.
-        self._submitting_xfer = None
 
     def _inflight_pop(self, tid: int) -> _InflightXfer | None:
         """Pop an inflight transfer and drop it from the request's set.
@@ -1178,12 +919,10 @@ class ServerRole:
         """
         results: list[StoreResult] = []
         for job_id in xfer.job_ids:
-            if (
-                job_id not in self._store_jobs
-                and job_id not in xfer.round.pending_job_ids
-            ):
+            if self._store_jobs.pop(job_id, None) is None:
                 continue
-            results.append(self._publish_store_result(job_id, success, xfer.round))
+            results.append(StoreResult(job_id=job_id, success=success))
+            xfer.round.pending_job_ids.discard(job_id)
         return results
 
     # ------------------------------------------------------------------
@@ -1193,100 +932,12 @@ class ServerRole:
     def _fail_round_jobs(self, rnd: _OutboundRequestState) -> list[StoreResult]:
         """Fail a terminated round's still-pending store jobs (idempotent)."""
         results: list[StoreResult] = []
-        for job_id in tuple(rnd.pending_job_ids):
-            results.append(self._publish_store_result(job_id, False, rnd))
+        for job_id in rnd.pending_job_ids:
+            if self._store_jobs.pop(job_id, None) is None:
+                continue
+            results.append(StoreResult(job_id=job_id, success=False))
+        rnd.pending_job_ids.clear()
         return results
-
-    def _publish_store_result(
-        self,
-        job_id: int,
-        success: bool,
-        rnd: _OutboundRequestState | None = None,
-    ) -> StoreResult:
-        """Publish the outcome before destructively unlinking its job."""
-        result = StoreResult(job_id=job_id, success=success)
-        existing = self._pending_store_results.setdefault(job_id, result)
-        if existing != result:
-            raise RuntimeError(f"conflicting terminal outcomes for store job {job_id}")
-        self._store_jobs.pop(job_id, None)
-        self._timed_out_store_jobs.discard(job_id)
-        if rnd is not None:
-            rnd.pending_job_ids.discard(job_id)
-        return result
-
-    def _adopt_transport_terminal(self, tid: int, outcome: str) -> None:
-        existing = self._terminal_transfers.get(tid)
-        if existing is not None:
-            if existing.outcome != outcome:
-                raise RuntimeError(f"conflicting outcomes for transfer {tid}")
-            return
-        xfer = self._inflight.get(tid)
-        if xfer is None:
-            logger.error(
-                "P2PSession %s: transport reported %s for unknown transfer_id=%d",
-                self._peer_id,
-                outcome,
-                tid,
-            )
-            return
-        self._terminal_transfers[tid] = _TerminalTransfer(xfer, outcome)
-
-    def _rebuild_inflight_state(self, xfer: _InflightXfer) -> None:
-        """Derive request and round indexes from the authoritative owner map."""
-        st = self._requests.get(xfer.kv_request_id)
-        if st is not None:
-            st.inflight_tids = {
-                tid
-                for tid, candidate in self._inflight.items()
-                if candidate.kv_request_id == xfer.kv_request_id
-            }
-        xfer.round.inflight = sum(
-            candidate.round is xfer.round for candidate in self._inflight.values()
-        )
-
-    def _drain_terminal_transfers(self) -> None:
-        for tid, receipt in tuple(self._terminal_transfers.items()):
-            xfer = receipt.xfer
-            rnd = xfer.round
-            if not receipt.applied:
-                if receipt.outcome != "done":
-                    self._mark_round_failed(xfer.kv_request_id, xfer.round_key, rnd)
-                owner = self._inflight.get(tid)
-                if owner is not None and owner is not xfer:
-                    raise RuntimeError("terminal transfer changed session owner")
-                self._inflight.pop(tid, None)
-                self._rebuild_inflight_state(xfer)
-
-                if receipt.outcome == "done" and not rnd.failed:
-                    existing_count = rnd.completed_blocks_by_tid.setdefault(
-                        tid, xfer.block_count
-                    )
-                    if existing_count != xfer.block_count:
-                        raise RuntimeError("terminal transfer changed block count")
-                    rnd.remaining = rnd.total_blocks - sum(
-                        rnd.completed_blocks_by_tid.values()
-                    )
-                    if rnd.remaining < 0:
-                        raise RuntimeError("completed blocks exceed fetch demand")
-                    self._settle_xfer_jobs(xfer, success=True)
-                    st = self._requests.get(xfer.kv_request_id)
-                    owned = st is not None and st.outbound.get(xfer.round_key) is rnd
-                    if owned and rnd.remaining == 0:
-                        self._finalize_outbound(
-                            xfer.kv_request_id, xfer.round_key, success=True
-                        )
-                    elif owned and rnd.finishing and rnd.inflight == 0:
-                        self._finalize_outbound(
-                            xfer.kv_request_id, xfer.round_key, success=False
-                        )
-                else:
-                    self._settle_xfer_jobs(xfer, success=False)
-                receipt.applied = True
-
-            self._transport.ack_completions(self._peer_id, (tid,))
-            self._terminal_transfers.pop(tid, None)
-            self._maybe_retire_finalizer((xfer.kv_request_id, xfer.round_key))
-            self._maybe_prune(xfer.kv_request_id)
 
     def _finalize_outbound(
         self,
@@ -1301,47 +952,21 @@ class ServerRole:
         ``send_done=False`` skips the TransferDoneMsg (terminal empty
         fetch). Other rounds of the id are untouched.
         """
-        finalizer_key = (kv_request_id, round_key)
-        finalizer = self._finalizing_rounds.get(finalizer_key)
-        if finalizer is None:
-            st = self._requests[kv_request_id]
-            req = st.outbound[round_key]
-        else:
-            req = finalizer.round
-            st = self._requests.get(kv_request_id)
-        guarded = self._submitting_xfer
-        if (
-            req.inflight
-            or any(xfer.round is req for xfer in self._inflight.values())
-            or (guarded is not None and guarded.round is req)
-        ):
-            raise RuntimeError(
-                "refusing to finalize outbound round while DMA is still "
-                f"active: kv_request_id={kv_request_id} round={round_key}"
-            )
-        if req.failed and not req.failure_settled:
-            raise RuntimeError(
-                "refusing to finalize failed outbound round before its "
-                f"quiescence journal settles: kv_request_id={kv_request_id} "
-                f"round={round_key}"
-            )
+        st = self._requests[kv_request_id]
+        req = st.outbound.pop(round_key)
         if success is None:
             success = req.demand_received and req.remaining == 0
-        if finalizer is None:
-            finalizer = _FinalizingRound(
-                round=req,
-                success=success,
-                send_done=send_done,
-                job_ids=frozenset(req.pending_job_ids),
-            )
-            self._finalizing_rounds[finalizer_key] = finalizer
-        elif finalizer.success != success or finalizer.send_done != send_done:
-            raise RuntimeError("outbound finalization outcome changed during retry")
-
-        if not finalizer.results_published:
-            for job_id in tuple(req.pending_job_ids):
-                self._publish_store_result(job_id, success, req)
-            finalizer.results_published = True
+        settled = self._fail_round_jobs(req) if not success else None
+        if settled is not None:
+            self._pending_store_results.extend(settled)
+        else:
+            for job_id in req.pending_job_ids:
+                if self._store_jobs.pop(job_id, None) is None:
+                    continue
+                self._pending_store_results.append(
+                    StoreResult(job_id=job_id, success=True)
+                )
+            req.pending_job_ids.clear()
         logger.debug(
             "P2PSession %s: finalize kv_request_id=%s round=%s success=%s "
             "remaining=%d leftover_available=%d send_done=%s",
@@ -1353,7 +978,7 @@ class ServerRole:
             len(req.available),
             send_done,
         )
-        if send_done and req.demand_received and not finalizer.message_sent:
+        if send_done and req.demand_received:
             self._send(
                 {
                     TYPE_KEY: TransferDoneMsg.TYPE,
@@ -1362,125 +987,67 @@ class ServerRole:
                     TransferDoneMsg.ROUND_SEQ: round_key,
                 }
             )
-            finalizer.message_sent = True
-        if not send_done or not req.demand_received:
-            finalizer.message_sent = True
-        if not finalizer.unlinked:
-            current = st.outbound.get(round_key) if st is not None else None
-            if current is not None and current is not req:
-                raise RuntimeError("outbound round changed during finalization")
-            if current is req:
-                del st.outbound[round_key]
-            finalizer.unlinked = True
         self._maybe_prune(kv_request_id)
-        self._maybe_retire_finalizer(finalizer_key)
-
-    def _maybe_retire_finalizer(self, finalizer_key: tuple[str, int]) -> None:
-        finalizer = self._finalizing_rounds.get(finalizer_key)
-        if finalizer is None or not finalizer.unlinked or not finalizer.message_sent:
-            return
-        if any(job_id in self._pending_store_results for job_id in finalizer.job_ids):
-            return
-        if any(
-            receipt.xfer.round is finalizer.round
-            for receipt in self._terminal_transfers.values()
-        ):
-            return
-        self._finalizing_rounds.pop(finalizer_key, None)
-
-    def _resume_finalizing_rounds(self) -> None:
-        """Resume one-shot finalization intents at the next poll boundary."""
-        for finalizer_key, finalizer in tuple(self._finalizing_rounds.items()):
-            self._finalize_outbound(
-                *finalizer_key,
-                success=finalizer.success,
-                send_done=finalizer.send_done,
-            )
 
     def _drain_abort(self, kv_request_id: str, round_seq: int) -> None:
         """One drain attempt for a pending abort.
 
-        Marks the aborted round failed, then asks the transport to cancel its
-        inflight transfers in ``mode="wait"``. Sends ``AbortAckMsg`` only
-        after nothing remains inflight. The timeout is diagnostic only: an
-        acknowledgement must never authorize destination reuse while a remote
-        write may still be active.
+        Detaches the aborted round, then asks the transport to cancel its
+        inflight transfers in ``mode="wait"``. Sends ``AbortAckMsg`` once
+        nothing remains inflight, or after ``_CANCEL_DRAIN_TIMEOUT_S``
+        falls back to ``mode="immediate"`` and acks anyway.
         """
         st = self._requests[kv_request_id]
+        rnd = st.outbound.pop(round_seq, None)
+        if rnd is not None:
+            # Its transfers are being cancelled; fail its jobs now
+            # instead of leaking them to the store timeout.
+            self._pending_store_results.extend(self._fail_round_jobs(rnd))
         ids = [
             tid
             for tid, x in self._inflight.items()
             if x.kv_request_id == kv_request_id and x.round_key == round_seq
         ]
-        rnd = st.outbound.get(round_seq)
-        if rnd is None and ids:
-            rounds = {
-                id(self._inflight[tid].round): self._inflight[tid].round for tid in ids
-            }
-            if len(rounds) != 1:
-                raise RuntimeError(
-                    "multiple outbound states own one abort round: "
-                    f"kv_request_id={kv_request_id} round={round_seq}"
-                )
-            rnd = next(iter(rounds.values()))
-            st.outbound[round_seq] = rnd
-        if rnd is not None:
-            self._mark_round_failed(
-                kv_request_id,
-                round_seq,
-                rnd,
-                send_done=False,
-            )
-            self._drain_failed_rounds()
+        if not ids:
+            self._finalize_abort(kv_request_id, round_seq)
+            return
 
         started_at = self._pending_aborts[(kv_request_id, round_seq)]
-        abort_key = (kv_request_id, round_seq)
-        if (
-            time.monotonic() - started_at >= _CANCEL_DRAIN_TIMEOUT_S
-            and abort_key not in self._abort_timeout_warned
-        ):
-            self._abort_timeout_warned.add(abort_key)
+        if time.monotonic() - started_at >= _CANCEL_DRAIN_TIMEOUT_S:
+            for tid in ids:
+                self._inflight_pop(tid)
+            self._transport.cancel(ids, mode="immediate")
             logger.warning(
                 "P2PSession %s: cancel drain timed out for kv_request_id=%s,"
-                " retaining %d transfers and continuing wait-mode drain",
+                " force-canceled %d transfers",
                 self._peer_id,
                 kv_request_id,
                 len(ids),
             )
+            self._finalize_abort(kv_request_id, round_seq)
+            return
 
-        if abort_key not in self._failed_rounds and not any(
-            x.kv_request_id == kv_request_id and x.round_key == round_seq
-            for x in self._inflight.values()
-        ):
+        still = self._transport.cancel(ids, mode="wait")
+        # Tids the transport successfully released are gone from its
+        # _inflight; mirror that in session bookkeeping so they don't
+        # block the drain forever waiting for a poll() event that will
+        # never come.
+        still_set = set(still)
+        for tid in ids:
+            if tid not in still_set:
+                self._inflight_pop(tid)
+        if not still:
             self._finalize_abort(kv_request_id, round_seq)
 
     def _finalize_abort(self, kv_request_id: str, round_seq: int) -> None:
-        guarded = self._submitting_xfer
-        if (
-            guarded is not None
-            and guarded.kv_request_id == kv_request_id
-            and guarded.round_key == round_seq
-        ):
-            raise RuntimeError(
-                "refusing to acknowledge abort while transfer submission "
-                f"ownership is unresolved: kv_request_id={kv_request_id} "
-                f"round={round_seq}"
-            )
-        abort_key = (kv_request_id, round_seq)
-        # Publish retry ownership before the fallible send and commit removal
-        # only after local control-transport acceptance.
-        self._abort_ack_intents.add(abort_key)
-        accepted = self._send(
+        self._pending_aborts.pop((kv_request_id, round_seq), None)
+        self._send(
             {
                 TYPE_KEY: AbortAckMsg.TYPE,
                 AbortAckMsg.KV_REQUEST_ID: kv_request_id,
                 AbortAckMsg.ROUND_SEQ: round_seq,
             }
         )
-        if accepted is False:
-            return
-        self._pending_aborts.pop(abort_key, None)
-        self._abort_timeout_warned.discard(abort_key)
         self._maybe_prune(kv_request_id)
 
     # ------------------------------------------------------------------
@@ -1494,15 +1061,6 @@ class ServerRole:
         rnd: _OutboundRequestState,
         round_key: int,
     ) -> None:
-        if self._submitting_xfer is not None:
-            raise RuntimeError("another transfer submission remains unresolved")
-        xfer = _InflightXfer(
-            kv_request_id=kv_request_id,
-            block_count=len(result.local_idxs),
-            job_ids=result.job_ids,
-            round=rnd,
-            round_key=round_key,
-        )
         logger.debug(
             "P2PSession %s: NIXL write_blocks CALL kv_request_id=%s "
             "local_idxs=%d remote_idxs=%d",
@@ -1511,181 +1069,70 @@ class ServerRole:
             len(result.local_idxs),
             len(result.remote_idxs),
         )
-        self._submitting_xfer = xfer
-        try:
-            # Feature selection is cached at construction, keeping the normal
-            # production path to one call plus the two guard-pointer stores.
-            # A legacy wrapper discards the token; if it is interrupted,
-            # recovery remains unsupported and fails closed.
-            transfer_id = self._submit_blocks_owned(
-                self._peer_id,
-                result.local_idxs,
-                result.remote_idxs,
-                recovery_token=xfer,
-            )
-
-            if transfer_id is None:
-                # An ordinary None return is the transport's proof that no
-                # request from this attempt can still access the buffers.
-                self._mark_round_failed(kv_request_id, round_key, rnd)
-                self._submitting_xfer = None
-                self._drain_failed_rounds()
-                logger.warning(
-                    "P2PSession %s: write_blocks failed for %s (%d blocks)",
-                    self._peer_id,
-                    kv_request_id,
-                    len(result.local_idxs),
-                )
-                return
-            if type(transfer_id) is not int:
-                raise TypeError("transport transfer_id must be an exact int")
-
-            # Primary owner, request index, and round count land in that order.
-            # Recovery reconstructs the latter two if an interruption cuts the
-            # sequence. The guard is the commit-last record.
-            self._inflight_add(transfer_id, xfer)
-            rnd.inflight += 1
-            self._submitting_xfer = None
-        except BaseException:
-            if self._submitting_xfer is xfer:
-                self._reconcile_submitting_transfer()
-                if self._failed_rounds:
-                    self._drain_failed_rounds()
-            raise
-
-        logger.debug(
-            "P2PSession %s: NIXL write_blocks SUBMITTED kv_request_id=%s "
-            "transfer_id=%d blocks=%d",
-            self._peer_id,
-            kv_request_id,
-            transfer_id,
-            len(result.local_idxs),
+        transfer_id = self._transport.write_blocks(
+            self._peer_id, result.local_idxs, result.remote_idxs
         )
-
-    def _mark_round_failed(
-        self,
-        kv_request_id: str,
-        round_key: int,
-        rnd: _OutboundRequestState,
-        *,
-        send_done: bool = True,
-    ) -> None:
-        """Publish failure ownership before any fallible drain operation."""
-        if not rnd.failed:
-            rnd.failed = True
-        # Clearing is deliberately idempotent: if an asynchronous exception
-        # cut a prior call after publishing ``failed``, retry still completes
-        # the tombstone before it can be drained.
-        rnd.available.clear()
-        rnd.demanded.clear()
-        if not send_done:
-            rnd.failure_send_done = False
-        self._failed_rounds[(kv_request_id, round_key)] = rnd
-
-    def _drain_failed_rounds(self) -> None:
-        """Wait-cancel failed rounds and publish outcomes after quiescence."""
-        for failure_key, rnd in tuple(self._failed_rounds.items()):
-            kv_request_id, round_key = failure_key
-            guarded = self._submitting_xfer
-            if guarded is not None and guarded.round is rnd:
-                raise RuntimeError(
-                    "refusing to drain failed round while transfer submission "
-                    f"ownership is unresolved: kv_request_id={kv_request_id} "
-                    f"round={round_key}"
-                )
-            st = self._requests.get(kv_request_id)
-            if st is None or st.outbound.get(round_key) is not rnd:
-                raise RuntimeError(
-                    "failed-round journal lost its authoritative owner: "
-                    f"kv_request_id={kv_request_id} round={round_key}"
-                )
-
-            ids = [tid for tid, xfer in self._inflight.items() if xfer.round is rnd]
-            still = self._transport.cancel(ids, mode="wait") if ids else []
-            still_set = set(still)
-            if not still_set.issubset(ids):
-                raise RuntimeError(
-                    "transport returned unexpected transfer IDs while draining "
-                    f"kv_request_id={kv_request_id} round={round_key}"
-                )
-            for tid in ids:
-                if tid in still_set:
-                    continue
-                # Cancellation proved this transfer quiescent. Publish the
-                # same local terminal receipt used by poll before unlinking
-                # any session owner; a cut can therefore replay safely.
-                self._adopt_transport_terminal(tid, "failed")
-            self._drain_terminal_transfers()
-            if still:
-                continue
-            if rnd.inflight or any(
-                xfer.round is rnd for xfer in self._inflight.values()
-            ):
-                raise RuntimeError(
-                    "failed round lost transfer ownership before quiescence: "
-                    f"kv_request_id={kv_request_id} round={round_key}"
-                )
-
-            if not rnd.failure_settled:
-                self._fail_round_jobs(rnd)
-                rnd.failure_settled = True
-            should_finalize = (
-                rnd.finishing
-                or not rnd.failure_send_done
-                or (rnd.demand_received and rnd.failure_send_done)
+        if transfer_id is not None:
+            logger.debug(
+                "P2PSession %s: NIXL write_blocks SUBMITTED kv_request_id=%s "
+                "transfer_id=%d blocks=%d",
+                self._peer_id,
+                kv_request_id,
+                transfer_id,
+                len(result.local_idxs),
             )
-            if should_finalize:
-                self._finalize_outbound(
-                    kv_request_id,
-                    round_key,
-                    success=False,
-                    send_done=rnd.failure_send_done,
-                )
-                rnd.failure_sent = rnd.demand_received and rnd.failure_send_done
-            del self._failed_rounds[failure_key]
-            self._maybe_prune(kv_request_id)
+            rnd.inflight += 1
+            self._inflight_add(
+                transfer_id,
+                _InflightXfer(
+                    kv_request_id=kv_request_id,
+                    block_count=len(result.local_idxs),
+                    job_ids=result.job_ids,
+                    round=rnd,
+                    round_key=round_key,
+                ),
+            )
+        else:
+            logger.warning(
+                "P2PSession %s: write_blocks failed for %s (%d blocks)",
+                self._peer_id,
+                kv_request_id,
+                len(result.local_idxs),
+            )
+            # The matched blocks were popped from rnd.demanded /
+            # rnd.available, but no inflight will satisfy them, so
+            # remaining will never reach 0 on its own. Mark the round
+            # as finishing so the existing terminal paths clean up: if
+            # other transfers of this round are in flight, the last one
+            # to drain will fire _finalize_outbound(success=False) via
+            # the elif branch in collect_results. If nothing else is in
+            # flight, finalize now so the peer and the local store jobs
+            # don't wait for finish_request or for _STORE_TIMEOUT_S /
+            # _LOAD_TIMEOUT_S.
+            rnd.finishing = True
+            st = self._requests.get(kv_request_id)
+            if (
+                st is not None
+                and st.outbound.get(round_key) is rnd
+                and rnd.inflight == 0
+            ):
+                self._finalize_outbound(kv_request_id, round_key, success=False)
 
-    def _timeout_pending_store_jobs(self) -> None:
+    def _timeout_pending_store_jobs(self) -> list[StoreResult]:
         if not self._store_jobs:
-            return
+            return []
         deadline = time.monotonic() - _STORE_TIMEOUT_S
         timed_out: list[int] | None = None
         for jid, submitted_at in self._store_jobs.items():
-            if submitted_at <= deadline and jid not in self._timed_out_store_jobs:
+            if submitted_at <= deadline:
                 if timed_out is None:
                     timed_out = []
                 timed_out.append(jid)
         if timed_out is None:
-            return
+            return []
+        results: list[StoreResult] = []
         for jid in timed_out:
-            owner: tuple[str, int, _OutboundRequestState] | None = None
-            for kv_request_id, st in self._requests.items():
-                for round_key, rnd in st.outbound.items():
-                    if jid in rnd.pending_job_ids:
-                        owner = (kv_request_id, round_key, rnd)
-                        break
-                if owner is not None:
-                    break
-            if owner is None:
-                # We cannot prove that an unindexed provider submission is
-                # quiescent. Retain the source pin and surface the invariant
-                # violation instead of reporting a failure unsafely.
-                logger.error(
-                    "P2PSession %s: timed-out store job %d has no outbound "
-                    "owner; retaining it because DMA quiescence is unknown",
-                    self._peer_id,
-                    jid,
-                )
-                self._timed_out_store_jobs.add(jid)
-                continue
-            self._timed_out_store_jobs.add(jid)
-            kv_request_id, round_key, rnd = owner
-            self._mark_round_failed(kv_request_id, round_key, rnd)
-            logger.warning(
-                "P2PSession %s: store job %d timed out; draining its "
-                "failed round before releasing source memory",
-                self._peer_id,
-                jid,
-            )
-        if self._failed_rounds:
-            self._drain_failed_rounds()
+            del self._store_jobs[jid]
+            results.append(StoreResult(job_id=jid, success=False))
+            logger.warning("P2PSession %s: store job %d timed out", self._peer_id, jid)
+        return results

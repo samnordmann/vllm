@@ -82,31 +82,6 @@ class JobMetadata(NamedTuple):
     tier_idx: int
 
 
-@dataclass
-class _CompletionReceipt:
-    """Top-level owner for one tier result until primary effects commit."""
-
-    job_metadata: JobMetadata
-    completed_job: JobResult
-    tier_acked: bool = False
-    primary_phase: str = "PENDING"
-    metrics_started: bool = False
-    unlinked: bool = False
-
-
-@dataclass
-class _StoreAcquisitionReceipt:
-    """Fail-stop receipt spanning non-idempotent primary.prepare_read()."""
-
-    job_id: JobId
-    keys: tuple[OffloadKey, ...]
-    req_context: ReqContext
-    tier_idx: int
-    phase: str = "PREPARE_ENTERED"
-    primary_spec: CPULoadStoreSpec | None = None
-    transfer_job: TransferJob | None = None
-
-
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     """CPUOffloadingManager with a primary/secondary transfer interface.
 
@@ -227,10 +202,6 @@ class TieringOffloadingManager(OffloadingManager):
         #   True:  secondary → primary (promotion)
         #   False: primary → secondary (cascade)
         self._jobs: dict[JobId, JobMetadata] = {}
-        self._completion_receipts: dict[JobId, _CompletionReceipt] = {}
-        self._store_acquisition: _StoreAcquisitionReceipt | None = None
-        self._closing = False
-        self._closed = False
         primary_view = self.primary_tier.get_kv_memoryview()
         assert primary_view.strides is not None
         self._metrics = TieringMetricsTracker(
@@ -288,8 +259,8 @@ class TieringOffloadingManager(OffloadingManager):
         """
         if self._processed_jobs_this_step:
             return
-        self._process_finished_jobs()
         self._processed_jobs_this_step = True
+        self._process_finished_jobs()
 
     def _complete_promotion(
         self, job_metadata: JobMetadata, completed_job: JobResult
@@ -336,92 +307,31 @@ class TieringOffloadingManager(OffloadingManager):
         3. For completed loads (secondary→primary): calls primary.complete_write()
            to make blocks available
         """
-        self._drain_completion_receipts()
         for i, tier in enumerate(self.secondary_tiers):
-            for completed_job in tier.peek_finished_jobs():
+            for completed_job in tier.get_finished_jobs():
                 job_id = completed_job.job_id
-                receipt = self._completion_receipts.get(job_id)
-                if receipt is None:
-                    job_metadata = self._jobs.get(job_id)
-                    assert job_metadata is not None, (
-                        f"Finished job_id {job_id} from tier #{i}"
-                        f" ({tier.tier_type}) not in _jobs"
-                    )
-                    assert job_metadata.tier_idx == i, (
-                        f"Finished job_id {job_id} reported by tier #{i}"
-                        f" but belongs to tier #{job_metadata.tier_idx}"
-                    )
-                    receipt = _CompletionReceipt(job_metadata, completed_job)
-                    self._completion_receipts[job_id] = receipt
-                elif (
-                    receipt.job_metadata.tier_idx != i
-                    or receipt.completed_job != completed_job
-                ):
-                    raise RuntimeError(
-                        f"conflicting replay for finished job_id {job_id}"
-                    )
-            self._drain_completion_receipts(tier_idx=i)
-
-    def _drain_completion_receipts(self, tier_idx: int | None = None) -> None:
-        """Apply each adopted result once, failing closed on ambiguity."""
-        for job_id, receipt in tuple(self._completion_receipts.items()):
-            job_metadata = receipt.job_metadata
-            if tier_idx is not None and job_metadata.tier_idx != tier_idx:
-                continue
-            tier = self.secondary_tiers[job_metadata.tier_idx]
-            if not receipt.tier_acked:
-                tier.ack_finished_jobs((job_id,))
-                receipt.tier_acked = True
-
-            transfer_job = job_metadata.transfer_job
-            entered_phase = (
-                "PROMOTION_ENTERED" if transfer_job.is_promotion else "RELEASE_ENTERED"
-            )
-            if receipt.primary_phase == entered_phase:
-                raise RuntimeError(
-                    "primary completion outcome is ambiguous for job "
-                    f"{job_id} ({entered_phase}); refusing to retry a "
-                    "non-idempotent primary operation"
+                job_metadata = self._pop_job(job_id)
+                assert job_metadata is not None, (
+                    f"Finished job_id {job_id} from tier #{i}"
+                    f" ({tier.tier_type}) not in _jobs"
                 )
-            if receipt.primary_phase == "PENDING":
-                # Publish intent before the non-idempotent primary call. If an
-                # asynchronous exception lands before DONE is stored, the
-                # receipt is a permanent quarantine: never decrement twice.
-                receipt.primary_phase = entered_phase
+                assert job_metadata.tier_idx == i, (
+                    f"Finished job_id {job_id} reported by tier #{i}"
+                    f" but belongs to tier #{job_metadata.tier_idx}"
+                )
+                transfer_job = job_metadata.transfer_job
+                self._metrics.on_job_finished(job_metadata, completed_job)
+
                 if transfer_job.is_promotion:
-                    self._complete_promotion(job_metadata, receipt.completed_job)
+                    # secondary→primary transfer (promotion) completed.
+                    # Make blocks available in primary tier.
+                    self._complete_promotion(job_metadata, completed_job)
                 else:
+                    # primary→secondary transfer completed.
+                    # Decrement ref_cnt on primary blocks.
                     self.primary_tier.complete_read(
                         transfer_job.keys, transfer_job.req_context
                     )
-                receipt.primary_phase = "DONE"
-
-            if not receipt.metrics_started:
-                # Metrics are advisory. Mark before calling so recovery cannot
-                # double-count even if the metrics callback is interrupted.
-                receipt.metrics_started = True
-                self._metrics.on_job_finished(job_metadata, receipt.completed_job)
-            if not receipt.unlinked:
-                owner = self._jobs.get(job_id)
-                if owner is not None and owner is not job_metadata:
-                    raise RuntimeError(f"job {job_id} changed owner")
-                self._jobs.pop(job_id, None)
-                receipt.unlinked = True
-            self._completion_receipts.pop(job_id, None)
-
-    def _check_no_ambiguous_store_acquisition(self) -> None:
-        receipt = self._store_acquisition
-        if receipt is None:
-            return
-        raise RuntimeError(
-            "primary.prepare_read acquisition is unresolved for store job "
-            f"{receipt.job_id} (phase={receipt.phase}); refusing eviction, "
-            "reuse, or teardown because the Primary API has no adoption token"
-        )
-
-    def _check_open(self) -> None:
-        if self._closing or self._closed:
-            raise RuntimeError("tiering offloading manager is closing or closed")
 
     @override
     def lookup(
@@ -452,8 +362,6 @@ class TieringOffloadingManager(OffloadingManager):
             MISS      — block not found in any tier, or primary is full
                         and cannot accept a promotion.
         """
-        self._check_open()
-        self._check_no_ambiguous_store_acquisition()
         # Poll first so a promotion that finished since the last call is
         # already reflected as HIT (not stale HIT_PENDING/MISS) below, and
         # so blocks freed by cascade or promotion completions are evictable
@@ -604,7 +512,6 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
-        self._check_open()
         return self.primary_tier.prepare_load(keys, req_context)
 
     @override
@@ -616,7 +523,6 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Blocks to mark as recently used.
             req_context: Per-request context.
         """
-        self._check_open()
         self.primary_tier.touch(keys, req_context)
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
@@ -633,7 +539,6 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Blocks that finished loading.
             req_context: Per-request context.
         """
-        self._check_open()
         self.primary_tier.complete_load(keys, req_context)
 
     @override
@@ -658,8 +563,6 @@ class TieringOffloadingManager(OffloadingManager):
             PrepareStoreOutput describing where to store blocks and what was
             evicted, or None if store cannot proceed.
         """
-        self._check_open()
-        self._check_no_ambiguous_store_acquisition()
         # Step 1: Poll for completed async jobs FIRST
         # _process_finished_jobs() handles two kinds of completions here:
         #  - Cascade completions (store to a secondary tier, either a local
@@ -780,8 +683,6 @@ class TieringOffloadingManager(OffloadingManager):
             success: Whether the GPU→primary transfer succeeded.
             req_context: Per-request context forwarded to primary.prepare_read().
         """
-        self._check_open()
-        self._check_no_ambiguous_store_acquisition()
         # Step 1: Complete store in primary tier (makes blocks loadable)
         self.primary_tier.complete_store(keys, req_context, success)
 
@@ -818,33 +719,17 @@ class TieringOffloadingManager(OffloadingManager):
         The caller is responsible for the actual data transfer and
         reporting completion via get_finished_jobs().
         """
-        self._check_open()
-        self._check_no_ambiguous_store_acquisition()
-        job_id = self._next_job_id()
-        stable_keys = tuple(keys)
-        receipt = _StoreAcquisitionReceipt(
-            job_id=job_id,
-            keys=stable_keys,
-            req_context=req_context,
-            tier_idx=tier_idx,
-        )
-        self._store_acquisition = receipt
-        primary_blocks_spec = self.primary_tier.prepare_read(stable_keys, req_context)
+        primary_blocks_spec = self.primary_tier.prepare_read(keys, req_context)
         assert isinstance(primary_blocks_spec, CPULoadStoreSpec)
-        receipt.primary_spec = primary_blocks_spec
-        receipt.phase = "PREPARED"
+        job_id = self._next_job_id()
         job_metadata = TransferJob(
             job_id=job_id,
-            keys=stable_keys,
+            keys=keys,
             block_ids=primary_blocks_spec.block_ids,
             is_promotion=False,
             req_context=req_context,
         )
-        receipt.transfer_job = job_metadata
-        receipt.phase = "JOB_READY"
         self._register_job(job_metadata, tier_idx)
-        receipt.phase = "COMMITTED"
-        self._store_acquisition = None
         return job_metadata
 
     @override
@@ -860,7 +745,6 @@ class TieringOffloadingManager(OffloadingManager):
         Returns REQUEST_LEVEL if ANY secondary tier wants request-level.
         Only stores REQUEST_LEVEL tier decisions for use in prepare_store.
         """
-        self._check_open()
         state = RequestState(req_context=req_context)
         self._metrics.on_new_request(req_context)
         for tier_idx, tier in enumerate(self.secondary_tiers):
@@ -887,7 +771,6 @@ class TieringOffloadingManager(OffloadingManager):
         *,
         exclude_tier_idx: int | None = None,
     ) -> None:
-        self._check_open()
         self.primary_tier.on_request_finished(req_context)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
@@ -927,7 +810,6 @@ class TieringOffloadingManager(OffloadingManager):
         Called once per scheduler step from
         OffloadingConnectorScheduler.build_connector_meta().
         """
-        self._check_open()
         # Catch-all poll: guarantees jobs are processed even on steps where
         # lookup()/prepare_store() were never called (e.g. no requests
         # scheduled but a tier still has_pending_work()).
@@ -969,7 +851,6 @@ class TieringOffloadingManager(OffloadingManager):
         Yields:
             New OffloadingEvents collected by each tier since the last call.
         """
-        self._check_open()
         yield from self.primary_tier.take_events()
         for tier in self.secondary_tiers:
             yield from tier.take_events()
@@ -989,8 +870,6 @@ class TieringOffloadingManager(OffloadingManager):
         retained so those requests can continue after the reset; finished
         requests are finalized and removed.
         """
-        self._check_open()
-        self._check_no_ambiguous_store_acquisition()
         for tier in self.secondary_tiers:
             tier.drain_jobs()
         # All tier I/O has stopped; consume their completion notifications
@@ -1023,7 +902,6 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:
-        self._check_open()
         stats = self.primary_tier.get_stats()
 
         if stats is not None and stats.is_empty():
@@ -1054,11 +932,6 @@ class TieringOffloadingManager(OffloadingManager):
         Every secondary tier is given a shutdown attempt. If any shutdown
         fails, preserve the primary mmap because a failed tier may still use it.
         """
-        if self._closed:
-            return
-        self._check_no_ambiguous_store_acquisition()
-        self._drain_completion_receipts()
-        self._closing = True
         shutdown_error: Exception | None = None
         for tier_idx, tier in enumerate(self.secondary_tiers):
             try:
@@ -1077,4 +950,3 @@ class TieringOffloadingManager(OffloadingManager):
             raise shutdown_error
 
         self.primary_tier.shutdown()
-        self._closed = True

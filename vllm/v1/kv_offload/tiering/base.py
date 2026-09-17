@@ -235,20 +235,6 @@ class SecondaryTierManager(ABC):
         """
         pass
 
-    def peek_finished_jobs(self) -> Iterable[JobResult]:
-        """Return terminal jobs without requiring immediate destruction.
-
-        The default preserves compatibility with legacy tiers whose
-        ``get_finished_jobs`` already drains its queue. Tiers that need
-        interruption-safe handoff override this together with
-        :meth:`ack_finished_jobs` and replay each result until acknowledged.
-        """
-        return self.get_finished_jobs()
-
-    def ack_finished_jobs(self, job_ids: Iterable[JobId]) -> None:
-        """Acknowledge results durably adopted by the parent manager."""
-        del job_ids
-
     def has_pending_work(self) -> bool:
         """Whether this tier needs the engine to keep stepping.
 
