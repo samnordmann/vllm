@@ -30,12 +30,25 @@ from vllm.v1.kv_offload.tiering.p2p.session import (
     P2PSession,
     StoreResult,
 )
+from vllm.v1.kv_offload.tiering.p2p.session import protocol as protocol_module
 from vllm.v1.kv_offload.tiering.p2p.session.client import (
     _ABORT_ACK_TIMEOUT_S,
     _LOAD_TIMEOUT_S,
 )
 from vllm.v1.kv_offload.tiering.p2p.session.protocol import (
+    MAX_BLOCK_INDEX,
+    MAX_ROUND_SEQ,
+    MAX_WIRE_KEY_BYTES,
+    MAX_WIRE_LIST_ITEMS,
+    SESSION_EPOCH_NBYTES,
+    SOURCE_EPOCH_KEY,
+    TARGET_EPOCH_KEY,
     TYPE_KEY,
+    UNSPECIFIED_EPOCH,
+    WIRE_MAJOR_KEY,
+    WIRE_MINOR_KEY,
+    WIRE_PROTOCOL_MAJOR,
+    WIRE_PROTOCOL_MINOR,
     AbortAckMsg,
     AbortFetchMsg,
     ConnectAckMsg,
@@ -63,6 +76,35 @@ from vllm.v1.kv_offload.tiering.p2p.session.session import (
 # Shared PYTHONHASHSEED used by the session under test and the fake peer's
 # ConnectMsg so the handshake succeeds unless a test overrides one side.
 _DEFAULT_HASH_SEED = "0"
+_DEFAULT_PEER_EPOCH = b"P" * SESSION_EPOCH_NBYTES
+
+_STATE_MESSAGE_TYPES = {
+    AbortAckMsg.TYPE,
+    AbortFetchMsg.TYPE,
+    DisconnectMsg.TYPE,
+    FetchMsg.TYPE,
+    LookupMsg.TYPE,
+    LookupRespMsg.TYPE,
+    TransferDoneMsg.TYPE,
+}
+
+
+def _channel_fields(
+    source_epoch: bytes = _DEFAULT_PEER_EPOCH,
+    target_epoch: bytes = b"L" * SESSION_EPOCH_NBYTES,
+) -> dict:
+    return {
+        SOURCE_EPOCH_KEY: source_epoch,
+        TARGET_EPOCH_KEY: target_epoch,
+    }
+
+
+class _CloseFailure(BaseException):
+    pass
+
+
+class _SubmissionFailure(BaseException):
+    pass
 
 
 class FakeDataTransport:
@@ -86,6 +128,8 @@ class FakeDataTransport:
         self._poll_failed: list[int] = []
         self._cancel_still_inflight: set[int] = set()
         self._cancel_calls: list[tuple[list[int], str]] = []
+        self._ack_calls: list[tuple[str | None, tuple[int, ...]]] = []
+        self._add_remote_calls: list[str] = []
 
     @property
     def base_addr(self) -> int:
@@ -109,6 +153,7 @@ class FakeDataTransport:
     def add_remote_peer(
         self, peer_id, agent_metadata, base_addr, num_blocks, block_len
     ) -> None:
+        self._add_remote_calls.append(peer_id)
         self._remote_peers[peer_id] = {
             ConnectMsg.AGENT_METADATA: agent_metadata,
             ConnectMsg.BASE_ADDR: base_addr,
@@ -151,15 +196,87 @@ class FakeDataTransport:
             self._cancel_still_inflight.discard(tid)
         return []
 
+    def ack_completions(self, peer_id, transfer_ids) -> None:
+        self._ack_calls.append((peer_id, tuple(transfer_ids)))
+
     def close(self) -> None:
         pass
+
+
+_DEFAULT_RECOVERY_RESULT = object()
+
+
+class _RecoveringDataTransport(FakeDataTransport):
+    """Owned-submit fake with exact-identity, peer-scoped recovery."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._owned: dict[int, tuple[str, object]] = {}
+        self.submitted_tokens: list[object] = []
+        self.recovery_calls: list[tuple[str, object]] = []
+        self.submit_error: BaseException | None = None
+        self.recovery_error: BaseException | None = None
+        self.recovery_result: object = _DEFAULT_RECOVERY_RESULT
+
+    def write_blocks_owned(
+        self,
+        peer_id,
+        local_idxs,
+        remote_idxs,
+        *,
+        recovery_token,
+    ) -> int | None:
+        transfer_id = super().write_blocks(peer_id, local_idxs, remote_idxs)
+        if transfer_id is None:
+            return None
+        self._owned[transfer_id] = (peer_id, recovery_token)
+        self.submitted_tokens.append(recovery_token)
+        if self.submit_error is not None:
+            error = self.submit_error
+            self.submit_error = None
+            raise error
+        return transfer_id
+
+    def recover_transfer_id(self, peer_id, recovery_token) -> int | None:
+        self.recovery_calls.append((peer_id, recovery_token))
+        if self.recovery_error is not None:
+            raise self.recovery_error
+        if self.recovery_result is not _DEFAULT_RECOVERY_RESULT:
+            return self.recovery_result  # type: ignore[return-value]
+        matches = [
+            (transfer_id, owner_peer)
+            for transfer_id, (owner_peer, token) in self._owned.items()
+            if token is recovery_token
+        ]
+        if len(matches) > 1:
+            raise RuntimeError("ambiguous recovery token")
+        if not matches:
+            return None
+        transfer_id, owner_peer = matches[0]
+        if owner_peer != peer_id:
+            raise RuntimeError("recovery token belongs to another peer")
+        return transfer_id
+
+    def cancel(self, transfer_ids, mode: str = "immediate") -> list[int]:
+        ids = list(transfer_ids)
+        still = super().cancel(ids, mode)
+        still_set = set(still)
+        for transfer_id in ids:
+            if transfer_id not in still_set:
+                self._owned.pop(transfer_id, None)
+        return still
 
 
 class FakeConnection:
     """Fake ControlConnection that captures sent messages."""
 
-    def __init__(self, peer_id: str = "peer:8000") -> None:
+    def __init__(
+        self,
+        peer_id: str = "peer:8000",
+        peer_epoch: bytes = _DEFAULT_PEER_EPOCH,
+    ) -> None:
         self.peer_id = peer_id
+        self.peer_epoch = peer_epoch
         self._inbox: list[dict] = []
         self._sent: list[dict] = []
         self._closed = False
@@ -180,8 +297,26 @@ class FakeConnection:
         self._inbox = []
         return msgs
 
-    def enqueue(self, msg: dict) -> None:
-        self._inbox.append(msg)
+    def enqueue(self, msg: dict, *, stamp_channel: bool = True) -> None:
+        inbound = dict(msg)
+        msg_type = inbound.get(TYPE_KEY)
+        if stamp_channel and msg_type == ConnectMsg.TYPE:
+            inbound[TARGET_EPOCH_KEY] = self._local_epoch()
+        elif stamp_channel and msg_type == ConnectAckMsg.TYPE:
+            inbound[WIRE_MAJOR_KEY] = WIRE_PROTOCOL_MAJOR
+            inbound[WIRE_MINOR_KEY] = WIRE_PROTOCOL_MINOR
+            inbound[SOURCE_EPOCH_KEY] = self.peer_epoch
+            inbound[TARGET_EPOCH_KEY] = self._local_epoch()
+        elif stamp_channel and msg_type in _STATE_MESSAGE_TYPES:
+            inbound[SOURCE_EPOCH_KEY] = self.peer_epoch
+            inbound[TARGET_EPOCH_KEY] = self._local_epoch()
+        self._inbox.append(inbound)
+
+    def _local_epoch(self) -> bytes:
+        connect = next(
+            msg for msg in self._sent if msg.get(TYPE_KEY) == ConnectMsg.TYPE
+        )
+        return connect[ConnectMsg.SOURCE_EPOCH]
 
     def mark_dead(self) -> None:
         self._closed = True
@@ -193,22 +328,45 @@ class FakeConnection:
 def _peer_connect_msg(
     peer_id: str = "peer:8000",
     block_len: int = 4096,
-    fingerprint: str | None = None,
+    fingerprint: str | None = "",
     hash_seed: str = _DEFAULT_HASH_SEED,
+    source_epoch: bytes = _DEFAULT_PEER_EPOCH,
+    target_epoch: bytes = UNSPECIFIED_EPOCH,
+    num_blocks: int = 16,
 ) -> dict:
     """Build a ConnectMsg as if the peer sent it."""
     msg = {
         TYPE_KEY: ConnectMsg.TYPE,
+        WIRE_MAJOR_KEY: WIRE_PROTOCOL_MAJOR,
+        WIRE_MINOR_KEY: WIRE_PROTOCOL_MINOR,
+        ConnectMsg.SOURCE_EPOCH: source_epoch,
+        ConnectMsg.TARGET_EPOCH: target_epoch,
         ConnectMsg.PEER_ID: peer_id,
         ConnectMsg.AGENT_METADATA: b"peer-metadata",
         ConnectMsg.BASE_ADDR: 0x2000,
-        ConnectMsg.NUM_BLOCKS: 16,
+        ConnectMsg.NUM_BLOCKS: num_blocks,
         ConnectMsg.BLOCK_LEN: block_len,
         ConnectMsg.HASH_SEED: hash_seed,
     }
     if fingerprint is not None:
         msg[ConnectMsg.CONFIG_FINGERPRINT] = fingerprint
     return msg
+
+
+def _peer_ack_msg(
+    *,
+    peer_id: str = "peer:8000",
+    source_epoch: bytes = _DEFAULT_PEER_EPOCH,
+    target_epoch: bytes,
+) -> dict:
+    return {
+        TYPE_KEY: ConnectAckMsg.TYPE,
+        WIRE_MAJOR_KEY: WIRE_PROTOCOL_MAJOR,
+        WIRE_MINOR_KEY: WIRE_PROTOCOL_MINOR,
+        ConnectAckMsg.PEER_ID: peer_id,
+        ConnectAckMsg.SOURCE_EPOCH: source_epoch,
+        ConnectAckMsg.TARGET_EPOCH: target_epoch,
+    }
 
 
 class FakeParent:
@@ -302,10 +460,21 @@ def _serve(session: P2PSession, parent: FakeParent) -> None:
 
 
 def _activate(
-    session: P2PSession, conn: FakeConnection, peer_id: str = "peer:8000"
+    session: P2PSession,
+    conn: FakeConnection,
+    peer_id: str = "peer:8000",
+    peer_epoch: bytes = _DEFAULT_PEER_EPOCH,
+    num_blocks: int = 16,
 ) -> None:
     """Drive the handshake: peer sends ConnectMsg + ConnectAckMsg."""
-    conn.enqueue(_peer_connect_msg(peer_id=peer_id))
+    conn.peer_epoch = peer_epoch
+    conn.enqueue(
+        _peer_connect_msg(
+            peer_id=peer_id,
+            source_epoch=peer_epoch,
+            num_blocks=num_blocks,
+        )
+    )
     conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: peer_id})
     session.poll()
 
@@ -380,21 +549,151 @@ class TestConnectHandshake:
         assert msg[ConnectMsg.NUM_BLOCKS] == 16
         assert msg[ConnectMsg.BLOCK_LEN] == 4096
         assert ConnectMsg.AGENT_METADATA in msg
+        assert msg[WIRE_MAJOR_KEY] == WIRE_PROTOCOL_MAJOR
+        assert msg[WIRE_MINOR_KEY] == WIRE_PROTOCOL_MINOR
+        assert type(msg[ConnectMsg.SOURCE_EPOCH]) is bytes
+        assert len(msg[ConnectMsg.SOURCE_EPOCH]) == SESSION_EPOCH_NBYTES
+        assert msg[ConnectMsg.SOURCE_EPOCH] != UNSPECIFIED_EPOCH
+        assert msg[ConnectMsg.TARGET_EPOCH] == UNSPECIFIED_EPOCH
+
+    def test_discovery_and_ack_wait_for_targeted_connect_before_import(self):
+        session, conn, transport = _make_session()
+        conn.enqueue(_peer_connect_msg(), stamp_channel=False)
+        conn.enqueue(
+            _peer_ack_msg(target_epoch=session._local_epoch),
+            stamp_channel=False,
+        )
+
+        session.poll()
+
+        assert session.alive
+        assert not session.ready
+        assert transport._add_remote_calls == []
+        assert any(
+            msg.get(TYPE_KEY) == ConnectMsg.TYPE
+            and msg[ConnectMsg.TARGET_EPOCH] == _DEFAULT_PEER_EPOCH
+            for msg in conn._sent
+        )
+
+        conn.enqueue(
+            _peer_connect_msg(target_epoch=session._local_epoch),
+            stamp_channel=False,
+        )
+        session.poll()
+
+        assert session.ready
+        assert transport._add_remote_calls == ["peer:8000"]
+
+    def test_unready_session_retries_identical_discovery_connect(self):
+        session, conn, _ = _make_session()
+        first = conn._sent[0]
+
+        session.poll()
+        assert conn._sent == [first]
+
+        session._last_discovery_send_at -= 1.0
+        session.poll()
+
+        discoveries = [
+            msg
+            for msg in conn._sent
+            if msg.get(TYPE_KEY) == ConnectMsg.TYPE
+            and msg[ConnectMsg.TARGET_EPOCH] == UNSPECIFIED_EPOCH
+        ]
+        assert len(discoveries) == 2
+        assert discoveries[0] is discoveries[1]
+
+    def test_ready_session_requires_two_frame_successor_proof(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        successor = b"N" * SESSION_EPOCH_NBYTES
+
+        conn.enqueue(
+            _peer_connect_msg(source_epoch=successor),
+            stamp_channel=False,
+        )
+        session.poll()
+
+        assert session.alive
+        assert session.ready
+        assert transport._add_remote_calls == ["peer:8000"]
+        assert not any(
+            msg.get(TYPE_KEY) == ConnectAckMsg.TYPE
+            and msg[ConnectAckMsg.TARGET_EPOCH] == successor
+            for msg in conn._sent
+        )
+
+        conn.enqueue(
+            _peer_ack_msg(
+                source_epoch=successor,
+                target_epoch=session._local_epoch,
+            ),
+            stamp_channel=False,
+        )
+        session.poll()
+        assert session.alive
+
+        conn.enqueue(
+            _peer_connect_msg(
+                source_epoch=successor,
+                target_epoch=session._local_epoch,
+            ),
+            stamp_channel=False,
+        )
+        session.poll()
+
+        assert not session.alive
+        assert transport._add_remote_calls == ["peer:8000"]
+
+    def test_invalid_different_epoch_handshake_cannot_kill_ready_session(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        retired = b"R" * SESSION_EPOCH_NBYTES
+
+        bad_connect = _peer_connect_msg(
+            source_epoch=retired,
+            target_epoch=session._local_epoch,
+            fingerprint="retired-config",
+        )
+        conn.enqueue(bad_connect, stamp_channel=False)
+        bad_ack = _peer_ack_msg(
+            source_epoch=retired,
+            target_epoch=session._local_epoch,
+        )
+        bad_ack[WIRE_MINOR_KEY] = WIRE_PROTOCOL_MINOR + 1
+        conn.enqueue(bad_ack, stamp_channel=False)
+
+        session.poll()
+
+        assert session.alive
+        assert session.ready
+        assert retired not in session._connect_candidates
+        assert retired not in session._acked_remote_epochs
+        assert transport._add_remote_calls == ["peer:8000"]
 
     def test_peer_connect_triggers_add_remote_and_ack(self):
-        """Receiving ConnectMsg registers peer and replies with ConnectAck."""
+        """Connect is acknowledged, but import waits for matching peer Ack."""
         session, conn, transport = _make_session()
         conn.enqueue(_peer_connect_msg())
         session.poll()
-        assert "peer:8000" in transport._remote_peers
+        assert "peer:8000" not in transport._remote_peers
         ack = next(m for m in conn._sent if m[TYPE_KEY] == ConnectAckMsg.TYPE)
         assert ack[ConnectAckMsg.PEER_ID] == "local:9000"
+        assert ack[ConnectAckMsg.SOURCE_EPOCH] == session._local_epoch
+        assert ack[ConnectAckMsg.TARGET_EPOCH] == _DEFAULT_PEER_EPOCH
+
+        conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
+        session.poll()
+        assert "peer:8000" in transport._remote_peers
 
     def test_connect_ack_makes_session_ready(self):
-        """Session.ready becomes True after ConnectAckMsg."""
+        """Ack alone is insufficient; matching Connect completes readiness."""
         session, conn, _ = _make_session()
         assert not session.ready
         conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
+        session.poll()
+        assert not session.ready
+        conn.enqueue(_peer_connect_msg())
         session.poll()
         assert session.ready
 
@@ -407,11 +706,76 @@ class TestConnectHandshake:
         # Before ack: only our ConnectMsg was sent.
         assert len(conn._sent) == 1
         assert conn._sent[0][TYPE_KEY] == ConnectMsg.TYPE
-        # Ack arrives.
+        # Matching Connect and Ack arrive.
+        conn.enqueue(_peer_connect_msg())
         conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
         session.poll()
         # Queued fetch is now sent.
         assert any(m[TYPE_KEY] == FetchMsg.TYPE for m in conn._sent)
+
+    def test_queued_abort_lost_return_replays_on_next_poll(self):
+        """The handshake ack is one-shot; a retained Abort must self-replay."""
+        session, conn, _ = _make_session()
+        session.request_blocks(
+            job_id=1, kv_request_id="req-abort-cut", keys=[b"k"], block_ids=[0]
+        )
+        session.finish_request("req-abort-cut")
+        assert [msg[TYPE_KEY] for msg in session._queued] == [
+            FetchMsg.TYPE,
+            AbortFetchMsg.TYPE,
+        ]
+
+        original_send = conn.send
+        lost_returns = 1
+
+        def send_then_interrupt(msg):
+            nonlocal lost_returns
+            original_send(msg)
+            if msg[TYPE_KEY] == AbortFetchMsg.TYPE and lost_returns:
+                lost_returns -= 1
+                raise _CloseFailure("queued abort lost return")
+
+        conn.send = send_then_interrupt  # type: ignore[method-assign]
+        conn.enqueue(_peer_connect_msg())
+        conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
+        with pytest.raises(_CloseFailure, match="queued abort lost return"):
+            session.poll()
+
+        assert [msg[TYPE_KEY] for msg in session._queued] == [AbortFetchMsg.TYPE]
+        assert ("req-abort-cut", 0) in session._client._abort_intents
+        session.poll()
+        assert session._queued == []
+        aborts = [msg for msg in conn._sent if msg[TYPE_KEY] == AbortFetchMsg.TYPE]
+        assert [msg[AbortFetchMsg.ROUND_SEQ] for msg in aborts] == [0, 0]
+
+    def test_queued_abort_ack_lost_return_replays_on_next_poll(self):
+        """A proven-quiescent queued AbortAck remains owned across a cut."""
+        session, conn, _ = _make_session()
+        session._server.on_abort_fetch("req-ack-cut", 7)
+        assert [msg[TYPE_KEY] for msg in session._queued] == [AbortAckMsg.TYPE]
+
+        original_send = conn.send
+        lost_returns = 1
+
+        def send_then_interrupt(msg):
+            nonlocal lost_returns
+            original_send(msg)
+            if msg[TYPE_KEY] == AbortAckMsg.TYPE and lost_returns:
+                lost_returns -= 1
+                raise _CloseFailure("queued abort ack lost return")
+
+        conn.send = send_then_interrupt  # type: ignore[method-assign]
+        conn.enqueue(_peer_connect_msg())
+        conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
+        with pytest.raises(_CloseFailure, match="queued abort ack lost return"):
+            session.poll()
+
+        assert [msg[TYPE_KEY] for msg in session._queued] == [AbortAckMsg.TYPE]
+        assert ("req-ack-cut", 7) in session._server._abort_ack_intents
+        session.poll()
+        assert session._queued == []
+        acks = [msg for msg in conn._sent if msg[TYPE_KEY] == AbortAckMsg.TYPE]
+        assert [msg[AbortAckMsg.ROUND_SEQ] for msg in acks] == [7, 7]
 
     def test_block_len_mismatch_marks_dead(self):
         """Mismatched block_len rejects peer and marks connection dead."""
@@ -435,17 +799,19 @@ class TestConnectHandshake:
         transport = FakeDataTransport(config_fingerprint="same_fp")
         session, conn, _ = _make_session(transport=transport)
         conn.enqueue(_peer_connect_msg(fingerprint="same_fp"))
+        conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
         session.poll()
         assert "peer:8000" in transport._remote_peers
         assert session.alive
 
-    def test_missing_fingerprint_allowed(self):
-        """Missing fingerprint on either side is allowed."""
+    def test_missing_fingerprint_rejected(self):
+        """Fingerprint is a mandatory exact string, including empty."""
         transport = FakeDataTransport(config_fingerprint="abc123")
         session, conn, _ = _make_session(transport=transport)
-        conn.enqueue(_peer_connect_msg())  # no fingerprint
+        conn.enqueue(_peer_connect_msg(fingerprint=None))
         session.poll()
-        assert "peer:8000" in transport._remote_peers
+        assert "peer:8000" not in transport._remote_peers
+        assert not session.alive
 
     def test_hash_seed_mismatch_marks_dead(self):
         """Mismatched PYTHONHASHSEED rejects peer and marks connection dead."""
@@ -460,6 +826,7 @@ class TestConnectHandshake:
         """Matching PYTHONHASHSEED registers the peer and acks."""
         session, conn, transport = _make_session(local_hash_seed="12345")
         conn.enqueue(_peer_connect_msg(hash_seed="12345"))
+        conn.enqueue({TYPE_KEY: ConnectAckMsg.TYPE, ConnectAckMsg.PEER_ID: "peer:8000"})
         session.poll()
         assert "peer:8000" in transport._remote_peers
         assert session.alive
@@ -469,6 +836,417 @@ class TestConnectHandshake:
         """Session advertises its own PYTHONHASHSEED in the ConnectMsg."""
         _, conn, _ = _make_session(local_hash_seed="777")
         assert conn._sent[0][ConnectMsg.HASH_SEED] == "777"
+
+    def test_connect_and_ack_from_different_epochs_do_not_provision(self):
+        session, conn, transport = _make_session()
+        old_epoch = b"O" * SESSION_EPOCH_NBYTES
+        current_epoch = b"N" * SESSION_EPOCH_NBYTES
+        session.request_blocks(1, "req-held", [b"k"], [0])
+
+        conn.enqueue(_peer_connect_msg(source_epoch=old_epoch))
+        conn.enqueue(
+            _peer_ack_msg(
+                source_epoch=current_epoch,
+                target_epoch=session._local_epoch,
+            ),
+            stamp_channel=False,
+        )
+        session.poll()
+
+        assert not session.ready
+        assert transport._add_remote_calls == []
+        assert [msg[TYPE_KEY] for msg in session._queued] == [FetchMsg.TYPE]
+
+        conn.enqueue(_peer_connect_msg(source_epoch=current_epoch))
+        session.poll()
+
+        assert session.ready
+        assert session._remote_epoch == current_epoch
+        assert transport._add_remote_calls == ["peer:8000"]
+        assert session._queued == []
+
+    def test_ack_for_retired_local_epoch_does_not_complete_or_kill(self):
+        session, conn, transport = _make_session()
+        conn.enqueue(_peer_connect_msg())
+        conn.enqueue(
+            _peer_ack_msg(target_epoch=b"X" * SESSION_EPOCH_NBYTES),
+            stamp_channel=False,
+        )
+        session.poll()
+
+        assert session.alive
+        assert not session.ready
+        assert transport._add_remote_calls == []
+
+        conn.enqueue(
+            _peer_ack_msg(target_epoch=session._local_epoch),
+            stamp_channel=False,
+        )
+        session.poll()
+        assert session.ready
+        assert transport._add_remote_calls == ["peer:8000"]
+
+    def test_retired_connect_and_ack_do_not_kill_ready_session(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        old_epoch = b"O" * SESSION_EPOCH_NBYTES
+
+        conn.enqueue(_peer_connect_msg(source_epoch=old_epoch))
+        conn.enqueue(
+            _peer_ack_msg(
+                source_epoch=old_epoch,
+                target_epoch=b"X" * SESSION_EPOCH_NBYTES,
+            ),
+            stamp_channel=False,
+        )
+        session.poll()
+
+        assert session.alive
+        assert session.ready
+        assert session._remote_epoch == _DEFAULT_PEER_EPOCH
+        assert transport._add_remote_calls == ["peer:8000"]
+
+    def test_ack_lost_return_replays_and_completes_without_peer_retry(self):
+        session, conn, transport = _make_session()
+        conn.enqueue(
+            _peer_ack_msg(target_epoch=session._local_epoch),
+            stamp_channel=False,
+        )
+        session.poll()
+        assert not session.ready
+
+        original_send = conn.send
+        interrupted = True
+
+        def send_then_interrupt(msg):
+            nonlocal interrupted
+            original_send(msg)
+            if msg[TYPE_KEY] == ConnectAckMsg.TYPE and interrupted:
+                interrupted = False
+                raise _CloseFailure("handshake Ack lost return")
+
+        conn.send = send_then_interrupt  # type: ignore[method-assign]
+        conn.enqueue(_peer_connect_msg())
+        with pytest.raises(_CloseFailure, match="handshake Ack lost return"):
+            session.poll()
+        assert not session.ready
+        assert transport._add_remote_calls == []
+        assert _DEFAULT_PEER_EPOCH in session._pending_connect_acks
+
+        session.poll()
+        assert session.ready
+        assert transport._add_remote_calls == ["peer:8000"]
+        acks = [msg for msg in conn._sent if msg[TYPE_KEY] == ConnectAckMsg.TYPE]
+        assert len(acks) == 2
+        assert acks[0] == acks[1]
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            (WIRE_MAJOR_KEY, True),
+            (WIRE_MAJOR_KEY, WIRE_PROTOCOL_MAJOR + 1),
+            (WIRE_MINOR_KEY, WIRE_PROTOCOL_MINOR + 1),
+        ),
+    )
+    def test_bad_connect_version_fails_before_import_or_flush(self, field, value):
+        session, conn, transport = _make_session()
+        session.request_blocks(1, "req-held", [b"k"], [0])
+        msg = _peer_connect_msg()
+        msg[field] = value
+        conn.enqueue(msg)
+        session.poll()
+
+        assert not session.alive
+        assert transport._add_remote_calls == []
+        assert [msg[TYPE_KEY] for msg in session._queued] == [FetchMsg.TYPE]
+
+    def test_bad_ack_version_fails_before_import_or_flush(self):
+        session, conn, transport = _make_session()
+        session.request_blocks(1, "req-held", [b"k"], [0])
+        conn.enqueue(_peer_connect_msg())
+        ack = _peer_ack_msg(target_epoch=session._local_epoch)
+        ack[WIRE_MINOR_KEY] = True
+        conn.enqueue(ack, stamp_channel=False)
+        session.poll()
+
+        assert not session.alive
+        assert transport._add_remote_calls == []
+        assert [msg[TYPE_KEY] for msg in session._queued] == [FetchMsg.TYPE]
+
+    @pytest.mark.parametrize(
+        ("local_fingerprint", "remote_fingerprint"),
+        (("", "remote"), ("local", "")),
+    )
+    def test_empty_and_nonempty_fingerprints_never_match(
+        self, local_fingerprint, remote_fingerprint
+    ):
+        transport = FakeDataTransport(config_fingerprint=local_fingerprint)
+        session, conn, _ = _make_session(transport=transport)
+        conn.enqueue(_peer_connect_msg(fingerprint=remote_fingerprint))
+        session.poll()
+
+        assert not session.alive
+        assert transport._add_remote_calls == []
+
+
+class TestSessionEpochIsolation:
+    @staticmethod
+    def _state_cases() -> tuple[tuple[dict, str, str], ...]:
+        return (
+            (
+                {
+                    TYPE_KEY: TransferDoneMsg.TYPE,
+                    TransferDoneMsg.KV_REQUEST_ID: "req",
+                    TransferDoneMsg.SUCCESS: True,
+                    TransferDoneMsg.ROUND_SEQ: 0,
+                },
+                "_client",
+                "on_transfer_done",
+            ),
+            (
+                {
+                    TYPE_KEY: AbortAckMsg.TYPE,
+                    AbortAckMsg.KV_REQUEST_ID: "req",
+                    AbortAckMsg.ROUND_SEQ: 0,
+                },
+                "_client",
+                "on_abort_ack",
+            ),
+            (
+                {
+                    TYPE_KEY: LookupRespMsg.TYPE,
+                    LookupRespMsg.KV_REQUEST_ID: "req",
+                    LookupRespMsg.KEYS: [b"k"],
+                    LookupRespMsg.HITS: [True],
+                    LookupRespMsg.ROUND_SEQ: 0,
+                },
+                "_client",
+                "on_lookup_resp",
+            ),
+            (
+                {
+                    TYPE_KEY: FetchMsg.TYPE,
+                    FetchMsg.KV_REQUEST_ID: "req",
+                    FetchMsg.KEYS: [b"k"],
+                    FetchMsg.BLOCK_INDEXES: [0],
+                    FetchMsg.ROUND_SEQ: 0,
+                },
+                "_server",
+                "on_fetch",
+            ),
+            (
+                {
+                    TYPE_KEY: LookupMsg.TYPE,
+                    LookupMsg.KV_REQUEST_ID: "req",
+                    LookupMsg.KEYS: [b"k"],
+                    LookupMsg.ROUND_SEQ: 0,
+                },
+                "_server",
+                "on_lookup",
+            ),
+            (
+                {
+                    TYPE_KEY: AbortFetchMsg.TYPE,
+                    AbortFetchMsg.KV_REQUEST_ID: "req",
+                    AbortFetchMsg.ROUND_SEQ: 0,
+                },
+                "_server",
+                "on_abort_fetch",
+            ),
+        )
+
+    @pytest.mark.parametrize(("msg", "role_name", "handler_name"), _state_cases())
+    @pytest.mark.parametrize(
+        "epoch_case",
+        ("retired_pair", "retired_source", "retired_target"),
+    )
+    def test_stale_state_frame_is_dropped_before_role_or_routing_mutation(
+        self, monkeypatch, msg, role_name, handler_name, epoch_case
+    ):
+        old, old_conn, _ = _make_session()
+        old_peer_epoch = b"O" * SESSION_EPOCH_NBYTES
+        _activate(old, old_conn, peer_epoch=old_peer_epoch)
+        old_local_epoch = old._local_epoch
+        old.close()
+        assert old.close_complete
+
+        current_peer_epoch = b"N" * SESSION_EPOCH_NBYTES
+        session, conn, _ = _make_session()
+        _activate(session, conn, peer_epoch=current_peer_epoch)
+        calls: list[tuple] = []
+        role = getattr(session, role_name)
+        monkeypatch.setattr(role, handler_name, lambda *args: calls.append(args))
+        source_epoch = (
+            current_peer_epoch if epoch_case == "retired_target" else old_peer_epoch
+        )
+        target_epoch = (
+            session._local_epoch if epoch_case == "retired_source" else old_local_epoch
+        )
+        stale = {
+            **msg,
+            SOURCE_EPOCH_KEY: source_epoch,
+            TARGET_EPOCH_KEY: target_epoch,
+        }
+
+        conn.enqueue(stale, stamp_channel=False)
+        result = session.poll()
+
+        assert session.alive
+        assert calls == []
+        assert result.new_fetch_ids == []
+
+    def test_stale_fetch_cannot_create_manager_binding_signal(self):
+        old, old_conn, _ = _make_session()
+        old_peer_epoch = b"O" * SESSION_EPOCH_NBYTES
+        _activate(old, old_conn, peer_epoch=old_peer_epoch)
+        old_local_epoch = old._local_epoch
+        old.close()
+
+        session, conn, _ = _make_session()
+        _activate(session, conn, peer_epoch=b"N" * SESSION_EPOCH_NBYTES)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.KV_REQUEST_ID: "req-stale-bind",
+                FetchMsg.KEYS: [b"k"],
+                FetchMsg.BLOCK_INDEXES: [0],
+                FetchMsg.ROUND_SEQ: 0,
+                SOURCE_EPOCH_KEY: old_peer_epoch,
+                TARGET_EPOCH_KEY: old_local_epoch,
+            },
+            stamp_channel=False,
+        )
+
+        result = session.poll()
+
+        # P2PSecondaryTierManager binds only IDs in new_fetch_ids. The stale
+        # frame is rejected before that journal or ServerRole is touched.
+        assert result.new_fetch_ids == []
+        assert "req-stale-bind" not in session._server._requests
+
+    def test_stale_disconnect_does_not_kill_replacement_session(self):
+        old, old_conn, _ = _make_session()
+        old_peer_epoch = b"O" * SESSION_EPOCH_NBYTES
+        _activate(old, old_conn, peer_epoch=old_peer_epoch)
+        old_local_epoch = old._local_epoch
+        old.close()
+
+        new, new_conn, _ = _make_session()
+        _activate(new, new_conn, peer_epoch=b"N" * SESSION_EPOCH_NBYTES)
+        new_conn.enqueue(
+            {
+                TYPE_KEY: DisconnectMsg.TYPE,
+                SOURCE_EPOCH_KEY: old_peer_epoch,
+                TARGET_EPOCH_KEY: old_local_epoch,
+            },
+            stamp_channel=False,
+        )
+
+        new.poll()
+
+        assert new.alive
+        assert new.ready
+
+    @pytest.mark.parametrize("missing", (SOURCE_EPOCH_KEY, TARGET_EPOCH_KEY))
+    def test_missing_epoch_fails_without_resolving_active_destination(self, missing):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.request_blocks(7, "req", [b"k"], [0])
+        msg = {
+            TYPE_KEY: TransferDoneMsg.TYPE,
+            TransferDoneMsg.KV_REQUEST_ID: "req",
+            TransferDoneMsg.SUCCESS: True,
+            TransferDoneMsg.ROUND_SEQ: 0,
+            SOURCE_EPOCH_KEY: _DEFAULT_PEER_EPOCH,
+            TARGET_EPOCH_KEY: session._local_epoch,
+        }
+        del msg[missing]
+
+        conn.enqueue(msg, stamp_channel=False)
+        result = session.poll()
+
+        assert not session.alive
+        assert result.loads == []
+        assert session._client.has_active_loads
+
+    @pytest.mark.parametrize("wrong", (SOURCE_EPOCH_KEY, TARGET_EPOCH_KEY))
+    def test_wrong_epoch_is_stale_not_a_protocol_kill(self, wrong):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.request_blocks(7, "req", [b"k"], [0])
+        msg = {
+            TYPE_KEY: TransferDoneMsg.TYPE,
+            TransferDoneMsg.KV_REQUEST_ID: "req",
+            TransferDoneMsg.SUCCESS: True,
+            TransferDoneMsg.ROUND_SEQ: 0,
+            SOURCE_EPOCH_KEY: _DEFAULT_PEER_EPOCH,
+            TARGET_EPOCH_KEY: session._local_epoch,
+        }
+        msg[wrong] = b"X" * SESSION_EPOCH_NBYTES
+
+        conn.enqueue(msg, stamp_channel=False)
+        result = session.poll()
+
+        assert session.alive
+        assert result.loads == []
+        assert session._client.has_active_loads
+
+    def test_old_terminals_cannot_resolve_new_token_zero_after_retirement(self):
+        old, old_conn, _ = _make_session()
+        old_peer_epoch = b"O" * SESSION_EPOCH_NBYTES
+        _activate(old, old_conn, peer_epoch=old_peer_epoch)
+        old_local_epoch = old._local_epoch
+        old.close()
+        assert old.close_complete
+
+        new, new_conn, _ = _make_session()
+        new_peer_epoch = b"N" * SESSION_EPOCH_NBYTES
+        _activate(new, new_conn, peer_epoch=new_peer_epoch)
+        new.request_blocks(7, "req-reused", [b"k"], [0])
+
+        for msg_type in (TransferDoneMsg, AbortAckMsg):
+            stale = {
+                TYPE_KEY: msg_type.TYPE,
+                msg_type.KV_REQUEST_ID: "req-reused",
+                msg_type.ROUND_SEQ: 0,
+                SOURCE_EPOCH_KEY: old_peer_epoch,
+                TARGET_EPOCH_KEY: old_local_epoch,
+            }
+            if msg_type is TransferDoneMsg:
+                stale[TransferDoneMsg.SUCCESS] = True
+            new_conn.enqueue(stale, stamp_channel=False)
+
+        assert new.poll().loads == []
+        assert new._client.has_active_loads
+
+        new_conn.enqueue(
+            {
+                TYPE_KEY: TransferDoneMsg.TYPE,
+                TransferDoneMsg.KV_REQUEST_ID: "req-reused",
+                TransferDoneMsg.SUCCESS: True,
+                TransferDoneMsg.ROUND_SEQ: 0,
+            }
+        )
+        assert new.poll().loads == [LoadResult(7, "req-reused", True)]
+
+    def test_fetch_index_must_fit_matched_requester_block_count(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn, num_blocks=2)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.KV_REQUEST_ID: "req",
+                FetchMsg.KEYS: [b"k"],
+                FetchMsg.BLOCK_INDEXES: [2],
+                FetchMsg.ROUND_SEQ: 0,
+            }
+        )
+
+        result = session.poll()
+
+        assert not session.alive
+        assert result.new_fetch_ids == []
+        assert transport._transfers == {}
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +1266,24 @@ class TestClientFlows:
         assert lookup[FetchMsg.KV_REQUEST_ID] == "req-1"
         assert lookup[FetchMsg.KEYS] == [b"k1", b"k2"]
         assert lookup[FetchMsg.BLOCK_INDEXES] == [0, 1]
+        assert lookup[SOURCE_EPOCH_KEY] == session._local_epoch
+        assert lookup[TARGET_EPOCH_KEY] == _DEFAULT_PEER_EPOCH
+
+    def test_round_token_exhaustion_fails_closed_without_wrap(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session._client._next_round_seq = MAX_ROUND_SEQ
+
+        session.request_blocks(1, "req-last", [b"last"], [0])
+        assert conn._sent[-1][FetchMsg.ROUND_SEQ] == MAX_ROUND_SEQ
+        sent_before = len(conn._sent)
+
+        with pytest.raises(OverflowError, match="operation-token space exhausted"):
+            session.request_blocks(2, "req-overflow", [b"overflow"], [1])
+
+        assert len(conn._sent) == sent_before
+        assert "req-overflow" not in session._client._requests
+        assert session._client._next_round_seq == MAX_ROUND_SEQ + 1
 
     def test_transfer_done_success(self):
         session, conn, _ = _make_session()
@@ -573,9 +1369,57 @@ class TestClientFlows:
         assert loads == [LoadResult(job_id=8, kv_request_id="req-1", success=False)]
         assert session._client.has_active_loads is False
         assert "req-1" not in session._client._requests
+        session.ack_results(load_job_ids=(8,))
         assert session.poll().loads == []
 
-    def test_finish_abort_timeout_emits_one_failure(self):
+    def test_stale_abort_ack_tombstone_cannot_finish_reused_request(self):
+        """An old server tombstone cannot prove a new generation quiescent."""
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        request_id = "req-reused"
+
+        session.request_blocks(1, request_id, [b"old"], [0])
+        old_token = conn._sent[-1][FetchMsg.ROUND_SEQ]
+        session.finish_request(request_id)
+        conn.enqueue(
+            {
+                TYPE_KEY: AbortAckMsg.TYPE,
+                AbortAckMsg.KV_REQUEST_ID: request_id,
+                AbortAckMsg.ROUND_SEQ: old_token,
+            }
+        )
+        assert session.poll().loads == [LoadResult(1, request_id, False)]
+        session.ack_results(load_job_ids=(1,))
+        assert request_id not in session._client._requests
+
+        # Materialize the peer-side lost-return tombstone, then reuse the same
+        # request ID. The new Fetch also drives a live fake DMA on the server
+        # role so replaying the old Ack exercises the unsafe ABA boundary.
+        session._server.on_abort_fetch(request_id, old_token)
+        assert (request_id, old_token) in session._server._abort_ack_intents
+        session.request_blocks(2, request_id, [b"new"], [1])
+        new_fetch = conn._sent[-1]
+        new_token = new_fetch[FetchMsg.ROUND_SEQ]
+        assert new_token > old_token
+
+        session.add_stored_blocks(request_id, [b"new"], [3], job_id=10)
+        conn.enqueue(dict(new_fetch))
+        session.poll()
+        assert session._server._inflight
+
+        sent_before = len(conn._sent)
+        session._server.on_abort_fetch(request_id, old_token)
+        stale_ack = next(
+            msg for msg in conn._sent[sent_before:] if msg[TYPE_KEY] == AbortAckMsg.TYPE
+        )
+        conn.enqueue(dict(stale_ack))
+
+        assert session.poll().loads == []
+        assert session._client._requests[request_id].loads[new_token].job_id == 2
+        assert session._client.has_active_loads is True
+        assert transport._transfers
+
+    def test_finish_abort_timeout_retains_destination_and_retries(self):
         session, conn, _ = _make_session()
         _activate(session, conn)
         session.request_blocks(
@@ -585,12 +1429,61 @@ class TestClientFlows:
         _client_load(session, "req-1").aborted_at = (
             time.monotonic() - _ABORT_ACK_TIMEOUT_S - 1.0
         )
+        session._client._abort_intents[("req-1", 0)].last_sent_at = (
+            time.monotonic() - _ABORT_ACK_TIMEOUT_S - 1.0
+        )
+        abort_count = sum(m[TYPE_KEY] == AbortFetchMsg.TYPE for m in conn._sent)
 
         loads = session.poll().loads
-        assert loads == [LoadResult(job_id=9, kv_request_id="req-1", success=False)]
-        assert session._client.has_active_loads is False
-        assert "req-1" not in session._client._requests
-        assert session.poll().loads == []
+        assert loads == []
+        assert session._client.has_active_loads is True
+        assert "req-1" in session._client._requests
+        assert sum(m[TYPE_KEY] == AbortFetchMsg.TYPE for m in conn._sent) == (
+            abort_count + 1
+        )
+
+    def test_abort_lost_return_retains_intent_and_retries_same_round(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.request_blocks(
+            job_id=91, kv_request_id="req-lost", keys=[b"k"], block_ids=[0]
+        )
+        original_send = conn.send
+        lost_returns = 1
+
+        def send_then_interrupt(msg):
+            nonlocal lost_returns
+            original_send(msg)
+            if msg[TYPE_KEY] == AbortFetchMsg.TYPE and lost_returns:
+                lost_returns -= 1
+                raise _CloseFailure("abort lost return")
+
+        conn.send = send_then_interrupt  # type: ignore[method-assign]
+        with pytest.raises(_CloseFailure, match="abort lost return"):
+            session.finish_request("req-lost")
+
+        load = _client_load(session, "req-lost")
+        assert ("req-lost", 0) in session._client._abort_intents
+        assert load.aborted_at is None
+        session.finish_request("req-lost")
+        assert load.aborted_at is not None
+        aborts = [m for m in conn._sent if m[TYPE_KEY] == AbortFetchMsg.TYPE]
+        assert [m[AbortFetchMsg.ROUND_SEQ] for m in aborts] == [0, 0]
+
+    def test_abort_send_exception_marks_dead_without_false_commit(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.request_blocks(
+            job_id=92, kv_request_id="req-dead", keys=[b"k"], block_ids=[0]
+        )
+        conn.fail_send = True
+
+        session.finish_request("req-dead")
+
+        load = _client_load(session, "req-dead")
+        assert ("req-dead", 0) in session._client._abort_intents
+        assert load.aborted_at is None
+        assert session.alive is False
 
     def test_late_transfer_done_after_abort_ack_is_ignored(self):
         session, conn, _ = _make_session()
@@ -610,6 +1503,7 @@ class TestClientFlows:
         assert session.poll().loads == [
             LoadResult(job_id=10, kv_request_id="req-1", success=False)
         ]
+        session.ack_results(load_job_ids=(10,))
 
         conn.enqueue(
             {
@@ -640,6 +1534,7 @@ class TestClientFlows:
         session.request_blocks(
             job_id=1, kv_request_id="req-1", keys=[b"k"], block_ids=[0]
         )
+        round_seq = conn._sent[-1][FetchMsg.ROUND_SEQ]
         assert client._active_loads == {"req-1"}
         assert client.has_active_loads is True
 
@@ -647,7 +1542,7 @@ class TestClientFlows:
         conn.enqueue(
             {
                 TYPE_KEY: TransferDoneMsg.TYPE,
-                TransferDoneMsg.ROUND_SEQ: 0,
+                TransferDoneMsg.ROUND_SEQ: round_seq,
                 TransferDoneMsg.KV_REQUEST_ID: "req-1",
                 TransferDoneMsg.SUCCESS: True,
             }
@@ -667,12 +1562,8 @@ class TestClientFlows:
         abort = conn._sent[-1]
         assert abort[TYPE_KEY] == AbortFetchMsg.TYPE
 
-    def test_load_abort_ack_timeout_surfaces_failure(self):
-        """After load timeout sends AbortFetch, if no AbortAck arrives within
-        _ABORT_ACK_TIMEOUT_S the request is surfaced as failed and removed
-        from _requests — the engine cannot wait forever on a peer that won't
-        ack.
-        """
+    def test_load_abort_ack_timeout_retries_without_publishing_failure(self):
+        """An AbortAck timeout cannot authorize destination reuse."""
         session, conn, _ = _make_session()
         _activate(session, conn)
         session.request_blocks(
@@ -696,9 +1587,17 @@ class TestClientFlows:
         _client_load(session, "req-7").aborted_at = (
             time.monotonic() - _ABORT_ACK_TIMEOUT_S - 1.0
         )
+        session._client._abort_intents[("req-7", 0)].last_sent_at = (
+            time.monotonic() - _ABORT_ACK_TIMEOUT_S - 1.0
+        )
+        abort_count = sum(m[TYPE_KEY] == AbortFetchMsg.TYPE for m in conn._sent)
         loads = session.poll().loads
-        assert loads == [LoadResult(job_id=7, kv_request_id="req-7", success=False)]
-        assert "req-7" not in session._client._requests
+        assert loads == []
+        assert "req-7" in session._client._requests
+        assert session._client.has_active_loads is True
+        assert sum(m[TYPE_KEY] == AbortFetchMsg.TYPE for m in conn._sent) == (
+            abort_count + 1
+        )
 
     def test_load_abort_ack_clears_request(self):
         """After load timeout sends AbortFetch, an arriving AbortAckMsg from
@@ -770,6 +1669,7 @@ class TestLookupFlow:
         conn.enqueue(
             {
                 TYPE_KEY: LookupRespMsg.TYPE,
+                LookupRespMsg.ROUND_SEQ: 0,
                 LookupRespMsg.KV_REQUEST_ID: "req-1",
                 LookupRespMsg.KEYS: [b"hA", b"hB"],
                 LookupRespMsg.HITS: [True, False],
@@ -803,6 +1703,7 @@ class TestLookupFlow:
         conn.enqueue(
             {
                 TYPE_KEY: LookupRespMsg.TYPE,
+                LookupRespMsg.ROUND_SEQ: 0,
                 LookupRespMsg.KV_REQUEST_ID: "req-1",
                 LookupRespMsg.KEYS: [b"hA"],
                 LookupRespMsg.HITS: [True],
@@ -905,6 +1806,66 @@ class TestLookupFlow:
         assert second[0][LookupMsg.KV_REQUEST_ID] == "req-1"
         assert second[0][LookupMsg.KEYS] == [b"hC"]
 
+    def test_terminal_tokens_survive_prune_and_request_id_reuse(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+
+        round_tokens = []
+        for key in (b"old", b"new"):
+            session.register_lookup("req-reused", key)
+            session.flush_pending_lookups()
+            lookup = next(
+                msg for msg in reversed(conn._sent) if msg[TYPE_KEY] == LookupMsg.TYPE
+            )
+            session.finish_request("req-reused")
+            terminal = conn._sent[-1]
+            assert terminal[TYPE_KEY] == FetchMsg.TYPE
+            assert terminal[FetchMsg.KEYS] == []
+            assert terminal[FetchMsg.ROUND_SEQ] == lookup[LookupMsg.ROUND_SEQ]
+            round_tokens.append(terminal[FetchMsg.ROUND_SEQ])
+            assert "req-reused" not in session._client._requests
+
+        assert round_tokens == [0, 1]
+
+    def test_delayed_old_lookup_hit_cannot_resolve_reused_request_key(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+
+        session.register_lookup("req-reused", b"same-key")
+        session.flush_pending_lookups()
+        old_token = conn._sent[-1][LookupMsg.ROUND_SEQ]
+        session.finish_request("req-reused")
+        assert "req-reused" not in session._client._requests
+
+        assert session.register_lookup("req-reused", b"same-key") is None
+        session.flush_pending_lookups()
+        new_token = conn._sent[-1][LookupMsg.ROUND_SEQ]
+        assert new_token > old_token
+
+        conn.enqueue(
+            {
+                TYPE_KEY: LookupRespMsg.TYPE,
+                LookupRespMsg.ROUND_SEQ: old_token,
+                LookupRespMsg.KV_REQUEST_ID: "req-reused",
+                LookupRespMsg.KEYS: [b"same-key"],
+                LookupRespMsg.HITS: [True],
+            }
+        )
+        session.poll()
+        assert session.register_lookup("req-reused", b"same-key") is None
+
+        conn.enqueue(
+            {
+                TYPE_KEY: LookupRespMsg.TYPE,
+                LookupRespMsg.ROUND_SEQ: new_token,
+                LookupRespMsg.KV_REQUEST_ID: "req-reused",
+                LookupRespMsg.KEYS: [b"same-key"],
+                LookupRespMsg.HITS: [False],
+            }
+        )
+        session.poll()
+        assert session.register_lookup("req-reused", b"same-key") is False
+
     def test_split_response_resolves_across_messages(self):
         """Producer may answer one LookupMsg's keys across multiple
         LookupRespMsgs — pairs are self-describing so each lands."""
@@ -919,6 +1880,7 @@ class TestLookupFlow:
         conn.enqueue(
             {
                 TYPE_KEY: LookupRespMsg.TYPE,
+                LookupRespMsg.ROUND_SEQ: 0,
                 LookupRespMsg.KV_REQUEST_ID: "req-1",
                 LookupRespMsg.KEYS: [b"hA"],
                 LookupRespMsg.HITS: [True],
@@ -927,6 +1889,7 @@ class TestLookupFlow:
         conn.enqueue(
             {
                 TYPE_KEY: LookupRespMsg.TYPE,
+                LookupRespMsg.ROUND_SEQ: 0,
                 LookupRespMsg.KV_REQUEST_ID: "req-1",
                 LookupRespMsg.KEYS: [b"hB"],
                 LookupRespMsg.HITS: [False],
@@ -998,6 +1961,7 @@ class TestLookupFlow:
         conn.enqueue(
             {
                 TYPE_KEY: LookupRespMsg.TYPE,
+                LookupRespMsg.ROUND_SEQ: 0,
                 LookupRespMsg.KV_REQUEST_ID: "req-1",
                 LookupRespMsg.KEYS: [b"hA"],
                 LookupRespMsg.HITS: [True],
@@ -1047,6 +2011,7 @@ class TestLookupFlow:
         assert len(resps) == 1
         resp = resps[0]
         assert resp[LookupRespMsg.KV_REQUEST_ID] == "req-1"
+        assert resp[LookupRespMsg.ROUND_SEQ] == 0
         assert resp[LookupRespMsg.KEYS] == [b"hX", b"hY", b"hZ"]
         assert resp[LookupRespMsg.HITS] == [False, False, False]
 
@@ -1357,7 +2322,7 @@ class TestServerLookupHandling:
                 FetchMsg.ROUND_SEQ: 0,
                 FetchMsg.KV_REQUEST_ID: "req-1",
                 FetchMsg.KEYS: [b"hA", b"hB"],
-                FetchMsg.BLOCK_INDEXES: [20, 21],
+                FetchMsg.BLOCK_INDEXES: [14, 15],
             }
         )
         session.poll()
@@ -1366,7 +2331,7 @@ class TestServerLookupHandling:
         assert len(transport._transfers) == 1
         _, (_peer, local, remote) = next(iter(transport._transfers.items()))
         assert local == [7, 8]
-        assert remote == [20, 21]
+        assert remote == [14, 15]
 
         # Drive the transport completion.
         transport._poll_done.append(0)
@@ -1384,6 +2349,64 @@ class TestServerLookupHandling:
 
 
 class TestServerFlows:
+    def test_owned_submit_success_uses_exact_guard_without_recovery_scan(self):
+        transport = _RecoveringDataTransport()
+        session, conn, _ = _make_session(transport=transport)
+        _activate(session, conn)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-owned",
+                FetchMsg.KEYS: [b"k"],
+                FetchMsg.BLOCK_INDEXES: [9],
+            }
+        )
+        session.poll()
+
+        session.add_stored_blocks("req-owned", [b"k"], [3], job_id=70)
+
+        assert session._server._submitting_xfer is None
+        xfer = session._server._inflight[0]
+        assert transport.submitted_tokens == [xfer]
+        assert transport.recovery_calls == []
+        assert session._server._requests["req-owned"].inflight_tids == {0}
+        assert xfer.round.inflight == 1
+
+    def test_none_recovery_proves_prepublication_and_clears_guard(self):
+        transport = _RecoveringDataTransport()
+        failure = _SubmissionFailure("before provider publication")
+
+        def interrupt_before_publication(
+            peer_id, local_idxs, remote_idxs, *, recovery_token
+        ):
+            del peer_id, local_idxs, remote_idxs
+            transport.submitted_tokens.append(recovery_token)
+            raise failure
+
+        transport.write_blocks_owned = interrupt_before_publication  # type: ignore[method-assign]
+        session, conn, _ = _make_session(transport=transport)
+        _activate(session, conn)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-prepublish",
+                FetchMsg.KEYS: [b"k"],
+                FetchMsg.BLOCK_INDEXES: [9],
+            }
+        )
+        session.poll()
+
+        with pytest.raises(_SubmissionFailure) as raised:
+            session.add_stored_blocks("req-prepublish", [b"k"], [3], job_id=69)
+        assert raised.value is failure
+        assert session._server._submitting_xfer is None
+        assert session._server._inflight == {}
+        assert len(transport.recovery_calls) == 1
+        assert transport.recovery_calls[0][1] is transport.submitted_tokens[0]
+        assert session.poll().stores == [StoreResult(job_id=69, success=False)]
+
     def test_store_then_fetch_matches(self):
         """Blocks stored before fetch demand are matched on demand arrival."""
         session, conn, transport = _make_session()
@@ -1403,6 +2426,27 @@ class TestServerFlows:
         _, (peer, local, remote) = next(iter(transport._transfers.items()))
         assert local == [0, 1]
         assert remote == [10, 11]
+
+    def test_pd_store_then_fetch_binds_session_global_token(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        session.add_stored_blocks("req-global", [b"k"], [4], job_id=17)
+
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 91,
+                FetchMsg.KV_REQUEST_ID: "req-global",
+                FetchMsg.KEYS: [b"k"],
+                FetchMsg.BLOCK_INDEXES: [12],
+            }
+        )
+        session.poll()
+
+        assert len(transport._transfers) == 1
+        xfer = next(iter(session._server._inflight.values()))
+        assert xfer.round_key == 91
+        assert -1 not in session._server._requests["req-global"].outbound
 
     def test_fetch_then_store_matches(self):
         """Fetch demand registered before store; store fulfills it."""
@@ -1532,9 +2576,8 @@ class TestServerFlows:
         assert _srv_abort_started(session, "req-1") is None
         assert tid not in session._server._inflight
 
-    def test_abort_fetch_force_cancels_after_timeout(self):
-        """If wait-mode never drains, the deadline forces immediate
-        cancel and an ack is still sent."""
+    def test_abort_fetch_timeout_retains_pin_and_defers_ack(self):
+        """A drain deadline is diagnostic, never permission to release."""
         session, conn, transport = _make_session()
         _activate(session, conn)
         tid = 42
@@ -1562,17 +2605,24 @@ class TestServerFlows:
         session._server._pending_aborts[("req-1", 0)] = (
             time.monotonic() - _CANCEL_DRAIN_TIMEOUT_S - 1.0
         )
-        # Even if the transport still claims it can't cancel, the
-        # session must force-pop and ack.
+        # Even after the warning deadline, retain ownership and keep waiting.
         transport._cancel_calls.clear()
 
         session.poll()
 
+        assert not any(m[TYPE_KEY] == AbortAckMsg.TYPE for m in conn._sent)
+        assert _srv_abort_started(session, "req-1") is not None
+        assert tid in session._server._inflight
+        assert transport._cancel_calls
+        assert all(mode == "wait" for _, mode in transport._cancel_calls)
+
+        # Only proven quiescence permits the owner to be released and acked.
+        transport._cancel_still_inflight.remove(tid)
+        session.poll()
         ack = next(m for m in conn._sent if m[TYPE_KEY] == AbortAckMsg.TYPE)
         assert ack[AbortAckMsg.KV_REQUEST_ID] == "req-1"
         assert _srv_abort_started(session, "req-1") is None
         assert tid not in session._server._inflight
-        assert ([tid], "immediate") in transport._cancel_calls
 
     def test_abort_fetch_idempotent_while_draining(self):
         """Receiving AbortFetchMsg twice for the same kv_request_id
@@ -1622,6 +2672,42 @@ class TestServerFlows:
         assert len(acks) == 1
         assert acks[0][AbortAckMsg.KV_REQUEST_ID] == "req-1"
 
+    def test_abort_ack_lost_return_retains_intent_and_replays(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        original_send = conn.send
+        lost_returns = 1
+
+        def send_then_interrupt(msg):
+            nonlocal lost_returns
+            original_send(msg)
+            if msg[TYPE_KEY] == AbortAckMsg.TYPE and lost_returns:
+                lost_returns -= 1
+                raise _CloseFailure("abort ack lost return")
+
+        conn.send = send_then_interrupt  # type: ignore[method-assign]
+        conn.enqueue(
+            {
+                TYPE_KEY: AbortFetchMsg.TYPE,
+                AbortFetchMsg.ROUND_SEQ: 0,
+                AbortFetchMsg.KV_REQUEST_ID: "req-ack-cut",
+            }
+        )
+        with pytest.raises(_CloseFailure, match="abort ack lost return"):
+            session.poll()
+
+        key = ("req-ack-cut", 0)
+        assert key in session._server._abort_ack_intents
+        assert key in session._server._pending_aborts
+        session._server.drain_pending_aborts()
+        assert key not in session._server._pending_aborts
+        acks = [m for m in conn._sent if m[TYPE_KEY] == AbortAckMsg.TYPE]
+        assert [m[AbortAckMsg.ROUND_SEQ] for m in acks] == [0, 0]
+
+        session._server.on_abort_fetch("req-ack-cut", 0)
+        acks = [m for m in conn._sent if m[TYPE_KEY] == AbortAckMsg.TYPE]
+        assert len(acks) == 3
+
     def test_store_timeout(self):
         session, conn, _ = _make_session()
         _activate(session, conn)
@@ -1655,6 +2741,7 @@ class TestServerFlows:
         stores = session.poll().stores
         assert StoreResult(job_id=1, success=False) in stores
         assert StoreResult(job_id=1, success=True) not in stores
+        session.ack_results(store_job_ids=(1,))
 
         # Transport later reports the same transfer as done — must not
         # emit a second (contradictory) StoreResult for job_id=1.
@@ -1688,12 +2775,279 @@ class TestServerFlows:
         assert [s for s in stores if s.job_id == 1] == [
             StoreResult(job_id=1, success=False)
         ]
+        session.ack_results(store_job_ids=(1,))
 
         transport._poll_failed.append(tid)
         stores = session.poll().stores
         assert all(s.job_id != 1 for s in stores), (
             f"unexpected duplicate StoreResult after timeout: {stores}"
         )
+
+    def test_active_store_timeout_waits_for_dma_quiescence(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        session.add_stored_blocks("req-1", [b"k1"], [0], job_id=1)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-1",
+                FetchMsg.KEYS: [b"k1"],
+                FetchMsg.BLOCK_INDEXES: [5],
+            }
+        )
+        session.poll()
+        tid = next(iter(transport._transfers))
+        transport._cancel_still_inflight.add(tid)
+        session._server._store_jobs[1] = time.monotonic() - 60.0
+
+        stores = session.poll().stores
+        assert all(result.job_id != 1 for result in stores)
+        assert 1 in session._server._store_jobs
+        assert tid in session._server._inflight
+        assert not any(msg[TYPE_KEY] == TransferDoneMsg.TYPE for msg in conn._sent)
+        assert all(mode == "wait" for _, mode in transport._cancel_calls)
+
+        transport._cancel_still_inflight.remove(tid)
+        stores = session.poll().stores
+        assert StoreResult(job_id=1, success=False) in stores
+        assert 1 not in session._server._store_jobs
+        assert tid not in session._server._inflight
+        assert _srv_outbound(session, "req-1") is None
+        done = [msg for msg in conn._sent if msg[TYPE_KEY] == TransferDoneMsg.TYPE]
+        assert len(done) == 1
+        assert done[0][TransferDoneMsg.SUCCESS] is False
+
+    def test_pre_demand_timeout_leaves_failed_tombstone(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        session.add_stored_blocks("req-1", [b"stale"], [0], job_id=1)
+        session._server._store_jobs[1] = time.monotonic() - 60.0
+
+        assert session.poll().stores == [StoreResult(job_id=1, success=False)]
+        session.ack_results(store_job_ids=(1,))
+        failed_round = _srv_outbound(session, "req-1")
+        assert failed_round.failed is True
+        assert failed_round.available == {}
+
+        # A producer batch arriving before the delayed fetch is rejected by
+        # the tombstone and never exposes its block to DMA.
+        session.add_stored_blocks("req-1", [b"late"], [1], job_id=2)
+        assert session.poll().stores == [StoreResult(job_id=2, success=False)]
+        session.ack_results(store_job_ids=(2,))
+        assert transport._transfers == {}
+
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-1",
+                FetchMsg.KEYS: [b"stale"],
+                FetchMsg.BLOCK_INDEXES: [5],
+            }
+        )
+        session.poll()
+        assert transport._transfers == {}
+        done = next(msg for msg in conn._sent if msg[TYPE_KEY] == TransferDoneMsg.TYPE)
+        assert done[TransferDoneMsg.SUCCESS] is False
+        assert transport._transfers == {}
+        assert _srv_outbound(session, "req-1") is None
+
+    def test_fetch_dispatch_fact_survives_server_call_to_store_cut(self):
+        """A consumed FetchMsg remains visible when server dispatch is cut."""
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        original = session._server.on_fetch
+
+        def dispatch_then_interrupt(*args, **kwargs):
+            original(*args, **kwargs)
+            raise _SubmissionFailure("after server fetch state committed")
+
+        session._server.on_fetch = dispatch_then_interrupt
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-cut",
+                FetchMsg.KEYS: [b"k"],
+                FetchMsg.BLOCK_INDEXES: [2],
+            }
+        )
+        with pytest.raises(_SubmissionFailure, match="fetch state committed"):
+            session.poll()
+
+        assert session.pending_results().new_fetch_ids == ["req-cut"]
+        assert _srv_outbound(session, "req-cut").demand_received is True
+        session._server.on_fetch = original
+        assert session.poll().new_fetch_ids == ["req-cut"]
+        session.ack_results(new_fetch_ids=("req-cut",))
+        assert session.poll().new_fetch_ids == []
+
+    def test_empty_fetch_finalization_resumes_after_result_publish_cut(self):
+        """The poll boundary resumes a finalizer created by empty FetchMsg."""
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.add_stored_blocks("req-cut", [b"leftover"], [0], job_id=41)
+        original = session._server._publish_store_result
+        interrupted = False
+
+        def publish_then_interrupt(*args, **kwargs):
+            nonlocal interrupted
+            result = original(*args, **kwargs)
+            if not interrupted:
+                interrupted = True
+                raise _SubmissionFailure("after store result publication")
+            return result
+
+        session._server._publish_store_result = publish_then_interrupt
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-cut",
+                FetchMsg.KEYS: [],
+                FetchMsg.BLOCK_INDEXES: [],
+            }
+        )
+        with pytest.raises(_SubmissionFailure, match="result publication"):
+            session.poll()
+
+        assert ("req-cut", 0) in session._server._finalizing_rounds
+        assert session._server._pending_store_results == {
+            41: StoreResult(job_id=41, success=True)
+        }
+        session._server._publish_store_result = original
+        result = session.poll()
+        assert result.stores == [StoreResult(job_id=41, success=True)]
+        assert not any(msg[TYPE_KEY] == TransferDoneMsg.TYPE for msg in conn._sent)
+        session.ack_results(store_job_ids=(41,), new_fetch_ids=("req-cut",))
+        assert session._server._finalizing_rounds == {}
+
+    def test_finish_finalization_resumes_after_result_publish_cut(self):
+        """A one-shot local finish cannot strand its outbound finalizer."""
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.add_stored_blocks("req-cut", [b"available"], [0], job_id=42)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-cut",
+                FetchMsg.KEYS: [b"missing"],
+                FetchMsg.BLOCK_INDEXES: [3],
+            }
+        )
+        session.poll()
+        original = session._server._publish_store_result
+        interrupted = False
+
+        def publish_then_interrupt(*args, **kwargs):
+            nonlocal interrupted
+            result = original(*args, **kwargs)
+            if not interrupted:
+                interrupted = True
+                raise _SubmissionFailure("after finish result publication")
+            return result
+
+        session._server._publish_store_result = publish_then_interrupt
+        with pytest.raises(_SubmissionFailure, match="finish result publication"):
+            session.finish_request("req-cut")
+
+        assert ("req-cut", 0) in session._server._finalizing_rounds
+        session._server._publish_store_result = original
+        result = session.poll()
+        assert result.stores == [StoreResult(job_id=42, success=False)]
+        terminals = [
+            msg
+            for msg in conn._sent
+            if msg[TYPE_KEY] == TransferDoneMsg.TYPE
+            and msg[TransferDoneMsg.KV_REQUEST_ID] == "req-cut"
+        ]
+        assert len(terminals) == 1
+        assert terminals[0][TransferDoneMsg.SUCCESS] is False
+        session.ack_results(store_job_ids=(42,), new_fetch_ids=("req-cut",))
+        assert session._server._finalizing_rounds == {}
+
+    def test_close_rejects_every_public_mutation_and_poll(self):
+        session, _, _ = _make_session()
+        session.close()
+
+        operations = (
+            lambda: session.request_blocks(1, "req", [b"k"], [0]),
+            lambda: session.add_stored_blocks("req", [b"k"], [0], 2),
+            lambda: session.finish_request("req"),
+            lambda: session.register_lookup("req", b"k"),
+            session.flush_pending_lookups,
+            lambda: session.serve_external_requests(FakeParent()),
+            session.poll,
+        )
+        for operation in operations:
+            with pytest.raises(RuntimeError, match="closing or closed"):
+                operation()
+
+    def test_failed_round_marks_done_sibling_failed_before_drain(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-1",
+                FetchMsg.KEYS: [b"k1", b"k2", b"k3"],
+                FetchMsg.BLOCK_INDEXES: [5, 6, 7],
+            }
+        )
+        session.poll()
+        for job_id, key, block_id in (
+            (1, b"k1", 0),
+            (2, b"k2", 1),
+            (3, b"k3", 2),
+        ):
+            session.add_stored_blocks("req-1", [key], [block_id], job_id=job_id)
+        tids = list(session._server._inflight)
+        transport._poll_done.append(tids[0])
+        transport._poll_failed.append(tids[1])
+        transport._cancel_still_inflight.add(tids[2])
+
+        stores = session.poll().stores
+        assert StoreResult(job_id=1, success=False) in stores
+        assert StoreResult(job_id=1, success=True) not in stores
+        assert StoreResult(job_id=2, success=False) in stores
+        assert all(result.job_id != 3 for result in stores)
+        assert tids[2] in session._server._inflight
+        assert not any(msg[TYPE_KEY] == TransferDoneMsg.TYPE for msg in conn._sent)
+
+        transport._cancel_still_inflight.remove(tids[2])
+        stores = session.poll().stores
+        assert StoreResult(job_id=3, success=False) in stores
+        assert session._server._inflight == {}
+        done = [msg for msg in conn._sent if msg[TYPE_KEY] == TransferDoneMsg.TYPE]
+        assert len(done) == 1
+        assert done[0][TransferDoneMsg.SUCCESS] is False
+        assert _srv_outbound(session, "req-1") is None
+
+    def test_finalize_refuses_to_release_active_round(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        session.add_stored_blocks("req-1", [b"k1"], [0], job_id=1)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-1",
+                FetchMsg.KEYS: [b"k1"],
+                FetchMsg.BLOCK_INDEXES: [5],
+            }
+        )
+        session.poll()
+        tid = next(iter(session._server._inflight))
+
+        with pytest.raises(RuntimeError, match="DMA is still active"):
+            session._server._finalize_outbound("req-1", 0, success=False)
+
+        assert tid in session._server._inflight
+        assert 1 in session._server._store_jobs
+        assert _srv_outbound(session, "req-1") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1955,7 +3309,8 @@ class TestFinishRequestServerSide:
 
         session.add_stored_blocks("req-1", [b"k1"], [0], job_id=42)
 
-        # Outbound was finalized immediately (no other inflight).
+        # Demand already exists, so quiescence plus the terminal failure fully
+        # retires the round. Only pre-demand failures need a late-fetch tombstone.
         assert _srv_outbound(session, "req-1") is None
         # Peer notified with success=False.
         msg = next(m for m in conn._sent if m[TYPE_KEY] == TransferDoneMsg.TYPE)
@@ -2027,12 +3382,8 @@ class TestFinishRequestServerSide:
         assert done[TransferDoneMsg.KV_REQUEST_ID] == "req-1"
         assert done[TransferDoneMsg.SUCCESS] is True
 
-    def test_write_blocks_failure_finalizes_after_last_inflight_completes(self):
-        """write_blocks returns None on a SECOND match while a first transfer
-        is still inflight. The request should NOT finalize until the inflight
-        completes, then the elif branch in collect_results
-        (``finishing and not _has_inflight_for(...)``) finalizes it as failure.
-        """
+    def test_write_blocks_failure_wait_cancels_existing_sibling(self):
+        """A failed second submit invalidates and drains the whole round."""
         session, conn, transport = _make_session()
         _activate(session, conn)
 
@@ -2059,30 +3410,191 @@ class TestFinishRequestServerSide:
         # Round 2: write_blocks fails for k2 while transfer_1 is still inflight.
         transport.write_blocks = lambda *a, **kw: None  # type: ignore[assignment]
         session.add_stored_blocks("req-1", [b"k2"], [1], job_id=200)
-        # No new transfer was registered.
-        assert list(session._server._inflight.keys()) == [tid_1]
-        # Marked finishing, but NOT finalized yet (transfer_1 still inflight).
-        assert outbound.finishing is True
-        assert _srv_outbound(session, "req-1") is not None
-        done_msgs = [m for m in conn._sent if m.get(TYPE_KEY) == TransferDoneMsg.TYPE]
-        assert done_msgs == []
-
-        # Transfer 1 completes — now ``_has_inflight_for("req-1")`` is False
-        # and the elif branch in collect_results fires _finalize(success=False).
-        # The k1 success result is direct; the k2 failure result is queued
-        # in _pending_store_results and surfaces on the NEXT poll.
-        transport._poll_done.append(tid_1)
-        stores_first = session.poll().stores
-        assert StoreResult(job_id=100, success=True) in stores_first
-        # Outbound state cleaned up; peer notified with success=False.
+        # The fake transport proves wait-cancel complete immediately. Both
+        # source jobs therefore fail together and the round becomes a
+        # tombstone; the first sibling is never reported successful.
+        assert tid_1 not in session._server._inflight
+        assert outbound.failed is True
         assert _srv_outbound(session, "req-1") is None
         done = next(m for m in conn._sent if m.get(TYPE_KEY) == TransferDoneMsg.TYPE)
         assert done[TransferDoneMsg.KV_REQUEST_ID] == "req-1"
         assert done[TransferDoneMsg.SUCCESS] is False
 
-        # Next poll drains the queued failure.
-        stores_second = session.poll().stores
-        assert StoreResult(job_id=200, success=False) in stores_second
+        stores = session.poll().stores
+        assert StoreResult(job_id=100, success=False) in stores
+        assert StoreResult(job_id=100, success=True) not in stores
+        assert StoreResult(job_id=200, success=False) in stores
+
+    @pytest.mark.parametrize(
+        "cut",
+        ["transport_return", "primary_map", "request_index", "round_counter"],
+    )
+    def test_submit_interruption_recovers_every_adoption_cut(self, cut):
+        """Every lost-return cut converges from identity and primary state."""
+        transport = _RecoveringDataTransport()
+        session, conn, _ = _make_session(transport=transport)
+        _activate(session, conn)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-cut",
+                FetchMsg.KEYS: [b"k"],
+                FetchMsg.BLOCK_INDEXES: [9],
+            }
+        )
+        session.poll()
+
+        failure = _SubmissionFailure(cut)
+        server = session._server
+        # Preserve the recovered transfer so assertions can inspect the fully
+        # rebuilt graph before a later poll proves quiescence.
+        transport._cancel_still_inflight.add(0)
+        if cut == "transport_return":
+            transport.submit_error = failure
+        else:
+
+            def interrupt_inflight_add(transfer_id, xfer):
+                server._inflight[transfer_id] = xfer
+                if cut == "primary_map":
+                    raise failure
+                server._get_or_create_request(xfer.kv_request_id).inflight_tids.add(
+                    transfer_id
+                )
+                if cut == "request_index":
+                    raise failure
+                xfer.round.inflight += 1
+                raise failure
+
+            server._inflight_add = interrupt_inflight_add  # type: ignore[method-assign]
+
+        with pytest.raises(_SubmissionFailure) as raised:
+            session.add_stored_blocks("req-cut", [b"k"], [3], job_id=71)
+        assert raised.value is failure
+
+        assert server._submitting_xfer is None
+        assert list(server._inflight) == [0]
+        xfer = server._inflight[0]
+        assert transport.submitted_tokens[-1] is xfer
+        assert server._requests["req-cut"].inflight_tids == {0}
+        assert xfer.round.inflight == 1
+        assert xfer.round.failed is True
+        assert server._failed_rounds[("req-cut", 0)] is xfer.round
+        assert len(transport.recovery_calls) == (1 if cut == "transport_return" else 0)
+        if transport.recovery_calls:
+            assert transport.recovery_calls[0][1] is xfer
+
+        transport._cancel_still_inflight.clear()
+        stores = session.poll().stores
+        assert stores == [StoreResult(job_id=71, success=False)]
+        assert server._inflight == {}
+        assert server._failed_rounds == {}
+
+    def test_ambiguous_recovery_retains_guard_pins_and_quiescence_barriers(self):
+        transport = _RecoveringDataTransport()
+        session, conn, _ = _make_session(transport=transport)
+        _activate(session, conn)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-ambiguous",
+                FetchMsg.KEYS: [b"k"],
+                FetchMsg.BLOCK_INDEXES: [9],
+            }
+        )
+        session.poll()
+        transport.submit_error = _SubmissionFailure("lost return")
+        ambiguity = RuntimeError("ambiguous recovery")
+        transport.recovery_error = ambiguity
+
+        with pytest.raises(RuntimeError) as raised:
+            session.add_stored_blocks("req-ambiguous", [b"k"], [3], job_id=72)
+        assert raised.value is ambiguity
+
+        server = session._server
+        guarded = server._submitting_xfer
+        assert guarded is not None
+        assert transport.submitted_tokens[-1] is guarded
+        assert 72 in server._store_jobs
+        assert server.has_inflight_transfers
+        assert server._has_inflight_for("req-ambiguous")
+        server._maybe_prune("req-ambiguous")
+        assert "req-ambiguous" in server._requests
+
+        with pytest.raises(RuntimeError, match="DMA is still active"):
+            server._finalize_outbound("req-ambiguous", 0, success=False)
+        server._mark_round_failed("req-ambiguous", 0, guarded.round)
+        with pytest.raises(RuntimeError, match="ownership is unresolved"):
+            server._drain_failed_rounds()
+        with pytest.raises(RuntimeError, match="ownership is unresolved"):
+            server._finalize_abort("req-ambiguous", 0)
+        with pytest.raises(RuntimeError) as close_error:
+            server.close()
+        assert close_error.value is ambiguity
+        assert server._close_journal is None
+        assert server._submitting_xfer is guarded
+        assert 72 in server._store_jobs
+
+    def test_interrupted_legacy_transport_without_recovery_fails_closed(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-legacy",
+                FetchMsg.KEYS: [b"k"],
+                FetchMsg.BLOCK_INDEXES: [9],
+            }
+        )
+        session.poll()
+
+        def lose_legacy_return(peer_id, local_idxs, remote_idxs):
+            FakeDataTransport.write_blocks(transport, peer_id, local_idxs, remote_idxs)
+            raise _SubmissionFailure("legacy lost return")
+
+        transport.write_blocks = lose_legacy_return  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="does not support"):
+            session.add_stored_blocks("req-legacy", [b"k"], [3], job_id=73)
+
+        assert session._server._submitting_xfer is not None
+        assert 73 in session._server._store_jobs
+        assert session._server._inflight == {}
+        assert transport._cancel_calls == []
+
+    def test_recovery_rejects_bool_id_and_primary_collision(self):
+        for invalid in (True, 0):
+            transport = _RecoveringDataTransport()
+            session, conn, _ = _make_session(transport=transport)
+            _activate(session, conn)
+            conn.enqueue(
+                {
+                    TYPE_KEY: FetchMsg.TYPE,
+                    FetchMsg.ROUND_SEQ: 0,
+                    FetchMsg.KV_REQUEST_ID: "req-invalid",
+                    FetchMsg.KEYS: [b"k"],
+                    FetchMsg.BLOCK_INDEXES: [9],
+                }
+            )
+            session.poll()
+            transport.submit_error = _SubmissionFailure("lost return")
+            transport.recovery_result = invalid
+            if invalid == 0:
+                other_round = _OutboundRequestState(inflight=1)
+                session._server._inflight[0] = _InflightXfer(
+                    kv_request_id="other",
+                    block_count=1,
+                    job_ids={999},
+                    round=other_round,
+                )
+
+            expected = TypeError if invalid is True else RuntimeError
+            with pytest.raises(expected):
+                session.add_stored_blocks("req-invalid", [b"k"], [3], job_id=74)
+            assert session._server._submitting_xfer is not None
+            assert 74 in session._server._store_jobs
+            assert transport._cancel_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -2243,6 +3755,145 @@ class TestDisconnect:
         assert set(result.failed_req_ids) == {"req-1", "req-2"}
         assert set(result.failed_stores) == {10}
         assert result.failed_serves == []
+        assert session.close_complete is False
+        assert session._client.has_active_loads is True
+
+    def test_dead_session_close_quarantines_unacknowledged_destination(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.request_blocks(101, "req-quarantine", [b"k"], [0])
+        conn.mark_dead()
+
+        result = session.close()
+
+        assert result.failed_jobs == [101]
+        assert session.close_complete is False
+        assert session._client.has_active_loads is True
+        assert _client_load(session, "req-quarantine").job_id == 101
+        assert session.close() is result
+
+    def test_close_retry_preserves_results_after_connection_failure(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.request_blocks(1, "req-1", [b"k"], [0])
+        session.add_stored_blocks("req-srv", [b"k"], [0], job_id=10)
+        primary = RuntimeError("connection close")
+        close_calls = 0
+
+        def close_connection():
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 1:
+                raise primary
+            conn._closed = True
+
+        conn.close = close_connection  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError) as raised:
+            session.close()
+
+        assert raised.value is primary
+        result = session.close()
+        assert result.failed_jobs == [1]
+        assert result.failed_req_ids == ["req-1"]
+        assert result.failed_stores == [10]
+        assert session.close() is result
+        assert close_calls == 2
+
+    def test_close_retry_after_cancel_preserves_all_result_fields(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        session.request_blocks(1, "req-load", [b"load"], [0])
+        assert session.register_lookup("req-probe", b"probe") is None
+
+        parent = FakeParent(pending={b"parked"})
+        _send_lookup(conn, "req-serve", [b"parked"])
+        session.poll()
+        _serve(session, parent)
+
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-store",
+                FetchMsg.KEYS: [b"store"],
+                FetchMsg.BLOCK_INDEXES: [7],
+            }
+        )
+        session.poll()
+        session.add_stored_blocks("req-store", [b"store"], [3], job_id=10)
+        assert session._server._inflight
+
+        primary = _CloseFailure("cancel interrupted")
+        original_cancel = transport.cancel
+        cancel_calls = 0
+
+        def cancel_once(transfer_ids, mode="immediate"):
+            nonlocal cancel_calls
+            cancel_calls += 1
+            if cancel_calls == 1:
+                raise primary
+            return original_cancel(transfer_ids, mode)
+
+        transport.cancel = cancel_once  # type: ignore[method-assign]
+        with pytest.raises(_CloseFailure) as raised:
+            session.close()
+
+        assert raised.value is primary
+        assert not session.alive
+        result = session.close()
+        assert result.failed_jobs == [1]
+        assert set(result.failed_req_ids) == {"req-load", "req-probe"}
+        assert result.failed_stores == [10]
+        assert len(result.failed_serves) == 1
+        assert ":req-serve:" in result.failed_serves[0].req_id
+        assert session.close() is result
+        assert cancel_calls == 2
+
+    def test_close_retains_store_failure_until_transfer_is_quiescent(self):
+        session, conn, transport = _make_session()
+        _activate(session, conn)
+        conn.enqueue(
+            {
+                TYPE_KEY: FetchMsg.TYPE,
+                FetchMsg.ROUND_SEQ: 0,
+                FetchMsg.KV_REQUEST_ID: "req-store",
+                FetchMsg.KEYS: [b"store"],
+                FetchMsg.BLOCK_INDEXES: [7],
+            }
+        )
+        session.poll()
+        session.add_stored_blocks("req-store", [b"store"], [3], job_id=10)
+        tid = next(iter(session._server._inflight))
+        transport._cancel_still_inflight.add(tid)
+
+        result = session.close()
+        assert result.failed_stores == [10]
+        assert session.close_complete is False
+        assert tid in session._server._inflight
+        assert 10 in session._server._store_jobs
+        assert transport._cancel_calls[-1] == ([tid], "wait")
+
+        transport._cancel_still_inflight.remove(tid)
+        assert session.close() is result
+        assert session.close_complete is True
+        assert session._server._inflight == {}
+        assert session._server._store_jobs == {}
+        assert transport._cancel_calls[-1] == ([tid], "wait")
+
+    def test_disconnect_send_baseexception_does_not_block_close(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+
+        def fail_disconnect(_msg):
+            raise _CloseFailure("disconnect send")
+
+        conn.send = fail_disconnect  # type: ignore[method-assign]
+        result = session.close()
+
+        assert result.failed_jobs == []
+        assert not session.connected
+        assert not session.alive
+        assert conn._closed
 
     def test_send_failure_marks_connection_dead(self):
         """A raising send must mark the connection dead, not silently drop
@@ -2272,6 +3923,7 @@ class TestDisconnect:
         conn.enqueue(
             {
                 TYPE_KEY: LookupRespMsg.TYPE,
+                LookupRespMsg.ROUND_SEQ: 0,
                 LookupRespMsg.KV_REQUEST_ID: "req-hit",
                 LookupRespMsg.KEYS: [b"hA"],
                 LookupRespMsg.HITS: [True],
@@ -2290,6 +3942,25 @@ class TestDisconnect:
 
 
 class TestAdversarial:
+    def test_lookup_response_missing_token_disconnects_without_resolving(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.register_lookup("req", b"same-key")
+        session.flush_pending_lookups()
+
+        conn.enqueue(
+            {
+                TYPE_KEY: LookupRespMsg.TYPE,
+                LookupRespMsg.KV_REQUEST_ID: "req",
+                LookupRespMsg.KEYS: [b"same-key"],
+                LookupRespMsg.HITS: [True],
+            }
+        )
+        session.poll()
+
+        assert session.alive is False
+        assert session._client._requests["req"].probes[b"same-key"] is None
+
     def test_unknown_message_type_logged(self):
         session, conn, _ = _make_session()
         _activate(session, conn)
@@ -2498,8 +4169,8 @@ class TestInflightPerReqInvariant:
         session.add_stored_blocks("req-A", [b"a1", b"a2"], [0, 1], job_id=10)
         session.add_stored_blocks("req-B", [b"b1", b"b2"], [2, 3], job_id=11)
         for kv_id, keys, indexes in (
-            ("req-A", [b"a1", b"a2"], [100, 101]),
-            ("req-B", [b"b1", b"b2"], [102, 103]),
+            ("req-A", [b"a1", b"a2"], [4, 5]),
+            ("req-B", [b"b1", b"b2"], [6, 7]),
         ):
             conn.enqueue(
                 {
@@ -2593,11 +4264,16 @@ class TestConnectMsgValidation:
     def _valid_msg(self) -> dict:
         return {
             TYPE_KEY: ConnectMsg.TYPE,
+            WIRE_MAJOR_KEY: WIRE_PROTOCOL_MAJOR,
+            WIRE_MINOR_KEY: WIRE_PROTOCOL_MINOR,
+            ConnectMsg.SOURCE_EPOCH: _DEFAULT_PEER_EPOCH,
+            ConnectMsg.TARGET_EPOCH: UNSPECIFIED_EPOCH,
             ConnectMsg.PEER_ID: "peer:1",
             ConnectMsg.AGENT_METADATA: b"meta",
             ConnectMsg.BASE_ADDR: 0x1000,
             ConnectMsg.NUM_BLOCKS: 8,
             ConnectMsg.BLOCK_LEN: 4096,
+            ConnectMsg.CONFIG_FINGERPRINT: "",
             ConnectMsg.HASH_SEED: "0",
         }
 
@@ -2652,11 +4328,100 @@ class TestConnectMsgValidation:
         with pytest.raises(ValueError, match="hash_seed"):
             ConnectMsg.validate(msg)
 
+    def test_missing_config_fingerprint(self):
+        msg = self._valid_msg()
+        del msg[ConnectMsg.CONFIG_FINGERPRINT]
+        with pytest.raises(ValueError, match="config_fingerprint"):
+            ConnectMsg.validate(msg)
+
+    def test_config_fingerprint_wrong_type(self):
+        msg = self._valid_msg()
+        msg[ConnectMsg.CONFIG_FINGERPRINT] = b"fingerprint"
+        with pytest.raises(ValueError, match="config_fingerprint"):
+            ConnectMsg.validate(msg)
+
+    @pytest.mark.parametrize(
+        "field",
+        (ConnectMsg.BASE_ADDR, ConnectMsg.NUM_BLOCKS, ConnectMsg.BLOCK_LEN),
+    )
+    def test_boolean_integer_rejected(self, field):
+        msg = self._valid_msg()
+        msg[field] = True
+        with pytest.raises(ValueError, match=field):
+            ConnectMsg.validate(msg)
+
+    def test_num_blocks_bound(self):
+        msg = self._valid_msg()
+        msg[ConnectMsg.NUM_BLOCKS] = MAX_BLOCK_INDEX + 2
+        with pytest.raises(ValueError, match="num_blocks"):
+            ConnectMsg.validate(msg)
+
+    def test_memory_span_overflow(self):
+        msg = self._valid_msg()
+        msg[ConnectMsg.BASE_ADDR] = MAX_ROUND_SEQ
+        msg[ConnectMsg.NUM_BLOCKS] = 2
+        msg[ConnectMsg.BLOCK_LEN] = 1
+        with pytest.raises(ValueError, match="address space"):
+            ConnectMsg.validate(msg)
+
+    def test_agent_metadata_bound(self, monkeypatch):
+        monkeypatch.setattr(protocol_module, "MAX_AGENT_METADATA_BYTES", 3)
+        msg = self._valid_msg()
+        msg[ConnectMsg.AGENT_METADATA] = b"four"
+        with pytest.raises(ValueError, match="agent_metadata"):
+            ConnectMsg.validate(msg)
+
+    @pytest.mark.parametrize("field", (WIRE_MAJOR_KEY, WIRE_MINOR_KEY))
+    def test_missing_version_field(self, field):
+        msg = self._valid_msg()
+        del msg[field]
+        with pytest.raises(ValueError, match=field):
+            ConnectMsg.validate(msg)
+
+    def test_missing_target_epoch(self):
+        msg = self._valid_msg()
+        del msg[ConnectMsg.TARGET_EPOCH]
+        with pytest.raises(ValueError, match="target_epoch"):
+            ConnectMsg.validate(msg)
+
+    def test_zero_source_epoch_is_reserved(self):
+        msg = self._valid_msg()
+        msg[ConnectMsg.SOURCE_EPOCH] = UNSPECIFIED_EPOCH
+        with pytest.raises(ValueError, match="reserved"):
+            ConnectMsg.validate(msg)
+
+
+class TestConnectAckValidation:
+    @staticmethod
+    def _valid_msg() -> dict:
+        return _peer_ack_msg(target_epoch=b"L" * SESSION_EPOCH_NBYTES)
+
+    def test_valid_message_passes(self):
+        ConnectAckMsg.validate(self._valid_msg())
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            (WIRE_MAJOR_KEY, True),
+            (WIRE_MINOR_KEY, WIRE_PROTOCOL_MINOR + 1),
+            (ConnectAckMsg.SOURCE_EPOCH, b"short"),
+            (ConnectAckMsg.SOURCE_EPOCH, UNSPECIFIED_EPOCH),
+            (ConnectAckMsg.TARGET_EPOCH, None),
+            (ConnectAckMsg.TARGET_EPOCH, UNSPECIFIED_EPOCH),
+        ),
+    )
+    def test_malformed_or_unsupported_field_rejected(self, field, value):
+        msg = self._valid_msg()
+        msg[field] = value
+        with pytest.raises(ValueError):
+            ConnectAckMsg.validate(msg)
+
 
 class TestFetchMsgValidation:
     def _valid_msg(self) -> dict:
         return {
             TYPE_KEY: FetchMsg.TYPE,
+            **_channel_fields(),
             FetchMsg.ROUND_SEQ: 0,
             FetchMsg.KV_REQUEST_ID: "req-1",
             FetchMsg.KEYS: [b"k1", b"k2"],
@@ -2665,6 +4430,13 @@ class TestFetchMsgValidation:
 
     def test_valid_message_passes(self):
         FetchMsg.validate(self._valid_msg())
+
+    @pytest.mark.parametrize("field", (SOURCE_EPOCH_KEY, TARGET_EPOCH_KEY))
+    def test_zero_channel_epoch_is_reserved(self, field):
+        msg = self._valid_msg()
+        msg[field] = UNSPECIFIED_EPOCH
+        with pytest.raises(ValueError, match="reserved"):
+            FetchMsg.validate(msg)
 
     def test_length_mismatch(self):
         msg = self._valid_msg()
@@ -2678,11 +4450,116 @@ class TestFetchMsgValidation:
         with pytest.raises(ValueError, match="invalid index"):
             FetchMsg.validate(msg)
 
+    @pytest.mark.parametrize("index", (True, MAX_BLOCK_INDEX + 1))
+    def test_non_exact_or_oversized_index(self, index):
+        msg = self._valid_msg()
+        msg[FetchMsg.BLOCK_INDEXES] = [0, index]
+        with pytest.raises(ValueError, match="invalid index"):
+            FetchMsg.validate(msg)
+
+    def test_oversized_key(self):
+        msg = self._valid_msg()
+        msg[FetchMsg.KEYS] = [b"k", b"x" * (MAX_WIRE_KEY_BYTES + 1)]
+        with pytest.raises(ValueError, match="keys"):
+            FetchMsg.validate(msg)
+
+    def test_oversized_list(self):
+        msg = self._valid_msg()
+        msg[FetchMsg.KEYS] = [b"k"] * (MAX_WIRE_LIST_ITEMS + 1)
+        with pytest.raises(ValueError, match="exceeds"):
+            FetchMsg.validate(msg)
+
+    def test_tuple_is_not_a_wire_list(self):
+        msg = self._valid_msg()
+        msg[FetchMsg.KEYS] = (b"k1", b"k2")
+        with pytest.raises(ValueError, match="expected list"):
+            FetchMsg.validate(msg)
+
+    @pytest.mark.parametrize("missing", (SOURCE_EPOCH_KEY, TARGET_EPOCH_KEY))
+    def test_channel_epoch_is_required(self, missing):
+        msg = self._valid_msg()
+        del msg[missing]
+        with pytest.raises(ValueError, match=missing):
+            FetchMsg.validate(msg)
+
+
+class TestRoundSeqValidation:
+    @staticmethod
+    def _messages(round_seq: object) -> tuple[tuple[type, dict], ...]:
+        return (
+            (
+                FetchMsg,
+                {
+                    **_channel_fields(),
+                    FetchMsg.KV_REQUEST_ID: "req",
+                    FetchMsg.ROUND_SEQ: round_seq,
+                    FetchMsg.KEYS: [],
+                    FetchMsg.BLOCK_INDEXES: [],
+                },
+            ),
+            (
+                LookupMsg,
+                {
+                    **_channel_fields(),
+                    LookupMsg.KV_REQUEST_ID: "req",
+                    LookupMsg.ROUND_SEQ: round_seq,
+                    LookupMsg.KEYS: [],
+                },
+            ),
+            (
+                LookupRespMsg,
+                {
+                    **_channel_fields(),
+                    LookupRespMsg.KV_REQUEST_ID: "req",
+                    LookupRespMsg.ROUND_SEQ: round_seq,
+                    LookupRespMsg.KEYS: [],
+                    LookupRespMsg.HITS: [],
+                },
+            ),
+            (
+                TransferDoneMsg,
+                {
+                    **_channel_fields(),
+                    TransferDoneMsg.KV_REQUEST_ID: "req",
+                    TransferDoneMsg.ROUND_SEQ: round_seq,
+                    TransferDoneMsg.SUCCESS: True,
+                },
+            ),
+            (
+                AbortFetchMsg,
+                {
+                    **_channel_fields(),
+                    AbortFetchMsg.KV_REQUEST_ID: "req",
+                    AbortFetchMsg.ROUND_SEQ: round_seq,
+                },
+            ),
+            (
+                AbortAckMsg,
+                {
+                    **_channel_fields(),
+                    AbortAckMsg.KV_REQUEST_ID: "req",
+                    AbortAckMsg.ROUND_SEQ: round_seq,
+                },
+            ),
+        )
+
+    @pytest.mark.parametrize("round_seq", (0, MAX_ROUND_SEQ))
+    def test_exact_uint64_tokens_are_accepted(self, round_seq):
+        for message_type, msg in self._messages(round_seq):
+            message_type.validate(msg)
+
+    @pytest.mark.parametrize("round_seq", (None, True, -1, MAX_ROUND_SEQ + 1))
+    def test_non_uint64_tokens_are_rejected(self, round_seq):
+        for message_type, msg in self._messages(round_seq):
+            with pytest.raises(ValueError, match="uint64 operation token"):
+                message_type.validate(msg)
+
 
 class TestTransferDoneMsgValidation:
     def test_valid_message_passes(self):
         msg = {
             TYPE_KEY: TransferDoneMsg.TYPE,
+            **_channel_fields(),
             TransferDoneMsg.ROUND_SEQ: 0,
             TransferDoneMsg.KV_REQUEST_ID: "req-1",
             TransferDoneMsg.SUCCESS: True,
@@ -2692,6 +4569,7 @@ class TestTransferDoneMsgValidation:
     def test_success_wrong_type(self):
         msg = {
             TYPE_KEY: TransferDoneMsg.TYPE,
+            **_channel_fields(),
             TransferDoneMsg.ROUND_SEQ: 0,
             TransferDoneMsg.KV_REQUEST_ID: "req-1",
             TransferDoneMsg.SUCCESS: 1,

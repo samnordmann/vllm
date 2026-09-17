@@ -44,8 +44,9 @@ Transfer lifecycle
    - Returns a transfer_id (opaque int) for tracking
    - Returns None if peer not registered or submission fails
 3. Poll: poll() → PollResult(done=[...], failed=[...])
-   - Returns transfer_ids that completed or failed since last poll
-   - Completed transfers are automatically cleaned up
+   - Cleans up terminal work and returns completed/failed transfer_ids
+   - Ack-capable transports replay outcomes until ack_completions(peer_id, ids)
+     confirms that the session adopted them; legacy transports return them once
 4. Cancel: cancel(transfer_ids, mode="immediate" | "wait")
    - Best-effort cancellation of inflight transfers
    - mode="wait" returns ids still in PROC/PEND so the caller can poll
@@ -66,7 +67,9 @@ Implementor contracts
 - close() releases all resources (memory registrations, handles).
   After close(), no other methods may be called.
 
-Threading model: no background threads. All I/O driven by poll().
+Threading model: transport-specific. ``poll()`` observes completions;
+an implementation may additionally use a provider-owned background progress
+thread when its configured contract requires one.
 """
 
 from __future__ import annotations
@@ -185,6 +188,26 @@ class DataTransport(ABC):
         """
         ...
 
+    def reap_retired_peers(self) -> None:
+        """Advance deferred teardown for peers with active transfers.
+
+        Most transports release peers synchronously and need no action here.
+        A transport with strict asynchronous memory lifetimes may retain a
+        disconnected peer until its work reaches a confirmed terminal state.
+        """
+        return None
+
+    def peer_retirement_complete(self, peer_id: str) -> bool:
+        """Return whether ``peer_id`` owns no data-plane resources.
+
+        Synchronous transports inherit ``True``. A transport that defers
+        ``remove_remote_peer`` must override this together with
+        ``reap_retired_peers`` so the manager keeps source-buffer pins until
+        transfer and peer teardown are proven complete.
+        """
+        del peer_id
+        return True
+
     @abstractmethod
     def write_blocks(
         self,
@@ -206,26 +229,77 @@ class DataTransport(ABC):
         """
         ...
 
+    def write_blocks_owned(
+        self,
+        peer_id: str,
+        local_idxs: list[int],
+        remote_idxs: list[int],
+        *,
+        recovery_token: object,
+    ) -> int | None:
+        """Submit with an opaque identity for lost-return recovery.
+
+        This compatibility implementation forwards to :meth:`write_blocks`.
+        A transport must override :meth:`recover_transfer_id` to resolve an
+        interrupted return; base recovery deliberately fails closed.
+        """
+        del recovery_token
+        return self.write_blocks(peer_id, local_idxs, remote_idxs)
+
+    def recover_transfer_id(
+        self,
+        peer_id: str,
+        recovery_token: object,
+    ) -> int | None:
+        """Recover exactly one request by peer and token identity.
+
+        ``None`` proves no provider request can access this attempt's buffers.
+        Ambiguous or unsupported recovery raises. Implementations compare the
+        token with ``is`` only.
+        """
+        del peer_id, recovery_token
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support transfer return recovery"
+        )
+
     @abstractmethod
     def poll(self, peer_id: str | None = None) -> PollResult:
         """Poll inflight transfers for completion.
 
         Args:
-            peer_id: If given, only poll (and drain) transfers submitted for
+            peer_id: If given, only poll transfers submitted for
                 this peer_id — the value passed to ``write_blocks``. This is
                 required when a single transport is shared across multiple
-                peer sessions: ``poll()`` pops completed handles, so an
-                unscoped poll by one session would consume and discard the
-                completions of its siblings, starving them. ``None`` polls
+                peer sessions: a legacy destructive implementation may pop
+                completed handles, so an unscoped poll by one session could
+                consume and discard its siblings' completions. ``None`` polls
                 every peer's transfers (used only for the shutdown drain).
 
         Returns:
             PollResult with lists of completed and failed transfer_ids.
             Completed/failed transfers are removed from the inflight set.
+            An ack-capable implementation replays each terminal ID until
+            :meth:`ack_completions`; a legacy implementation may still return
+            each terminal only once.
 
         Must be called periodically to drive progress checking.
         """
         ...
+
+    def ack_completions(
+        self,
+        peer_id: str,
+        transfer_ids: Iterable[int],
+    ) -> None:
+        """Acknowledge terminal IDs durably adopted by the caller.
+
+        The compatibility implementation is a no-op for legacy transports
+        whose :meth:`poll` remains destructive.  An implementation that
+        overrides this method must make ``poll(peer_id)`` a non-destructive
+        peek: each cleaned terminal ID is replayed with the same outcome until
+        it is acknowledged here.  Repeating an acknowledgement is idempotent.
+        """
+        del peer_id, transfer_ids
 
     @abstractmethod
     def cancel(

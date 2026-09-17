@@ -2,9 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from vllm.v1.kv_offload.tiering.p2p.data.base import DataTransport, PollResult
 from vllm.v1.kv_offload.tiering.p2p.data.nixl import NixlTransport
+from vllm.v1.kv_offload.tiering.p2p.data.torch_transfer import (
+    TorchTransferTransport,
+)
 
 __all__ = [
     "DataTransport",
     "NixlTransport",
     "PollResult",
+    "TorchTransferTransport",
 ]

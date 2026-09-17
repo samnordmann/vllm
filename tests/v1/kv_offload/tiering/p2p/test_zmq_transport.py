@@ -6,15 +6,21 @@ from __future__ import annotations
 
 import socket
 import time
+from unittest.mock import MagicMock
 
 import pytest
 import zmq
 
+from vllm.v1.kv_offload.tiering.p2p.control import zmq as zmq_module
 from vllm.v1.kv_offload.tiering.p2p.control.zmq import (
     ZmqConnection,
     ZmqTransport,
     _Sockets,
 )
+
+
+class _ZmqLifecycleFailure(BaseException):
+    pass
 
 
 def _free_port() -> int:
@@ -73,8 +79,6 @@ def _wait_for_messages(
 
 def _make_mock_connection(peer_id: str = "test:1234") -> ZmqConnection:
     """Create a ZmqConnection with mock sockets for unit testing."""
-    from unittest.mock import MagicMock
-
     sockets = _Sockets(dealer=MagicMock(), monitor=MagicMock())
     return ZmqConnection(peer_id, sockets)
 
@@ -113,6 +117,189 @@ class TestZmqConnection:
 
         with pytest.raises(RuntimeError, match="closed connection"):
             conn.send({"type": "test"})
+
+    def test_send_rejects_oversized_control_frame(self, monkeypatch):
+        conn = _make_mock_connection()
+        monkeypatch.setattr(zmq_module, "MAX_CONTROL_MESSAGE_BYTES", 16)
+
+        with pytest.raises(ValueError, match="control message exceeds"):
+            conn.send({"payload": "x" * 64})
+
+        conn._sockets.dealer.send.assert_not_called()
+
+    def test_close_retries_only_the_incomplete_socket(self):
+        primary = _ZmqLifecycleFailure("monitor close")
+        conn = _make_mock_connection()
+        conn._sockets.monitor.close.side_effect = [primary, None]
+
+        with pytest.raises(_ZmqLifecycleFailure) as raised:
+            conn.close()
+
+        assert raised.value is primary
+        assert conn._sockets.monitor.close.call_count == 1
+        assert conn._sockets.dealer.close.call_count == 1
+        assert conn._closed is False
+        conn.close()
+        conn.close()
+        assert conn._sockets.monitor.close.call_count == 2
+        assert conn._sockets.dealer.close.call_count == 1
+        assert conn._closed is True
+
+
+class TestZmqTransactionalLifecycle:
+    def test_successful_constructor_ignores_logging_failure(self, monkeypatch):
+        router = MagicMock()
+        context = MagicMock()
+        context.socket.return_value = router
+        monkeypatch.setattr(zmq_module.zmq, "Context", MagicMock(return_value=context))
+        monkeypatch.setattr(
+            zmq_module.logger,
+            "info",
+            MagicMock(side_effect=_ZmqLifecycleFailure("logging")),
+        )
+
+        transport = ZmqTransport("local:1", "127.0.0.1", 1)
+
+        assert transport._router is router
+        assert transport._zmq_ctx is context
+        transport.close()
+
+    def test_constructor_bind_failure_releases_router_and_context(self, monkeypatch):
+        primary = _ZmqLifecycleFailure("bind")
+        cleanup = _ZmqLifecycleFailure("cleanup")
+        events: list[str] = []
+        router = MagicMock()
+        context = MagicMock()
+        context.socket.return_value = router
+        router.bind.side_effect = primary
+
+        def close_router(*, linger):
+            assert linger == 0
+            events.append("router")
+            raise cleanup
+
+        def destroy_context(*, linger):
+            assert linger == 0
+            events.append("context")
+            raise cleanup
+
+        router.close.side_effect = close_router
+        context.destroy.side_effect = destroy_context
+        monkeypatch.setattr(zmq_module.zmq, "Context", MagicMock(return_value=context))
+
+        with pytest.raises(_ZmqLifecycleFailure) as raised:
+            ZmqTransport("local:1", "127.0.0.1", 1)
+
+        assert raised.value is primary
+        assert events == ["router", "context"]
+
+    def test_open_failure_defers_sockets_whose_cleanup_failed(self, monkeypatch):
+        primary = _ZmqLifecycleFailure("dealer connect")
+        cleanup = _ZmqLifecycleFailure("socket cleanup")
+        router = MagicMock()
+        dealer = MagicMock()
+        monitor = MagicMock()
+        context = MagicMock()
+        context.socket.side_effect = [router, dealer, monitor]
+        monkeypatch.setattr(zmq_module.zmq, "Context", MagicMock(return_value=context))
+        transport = ZmqTransport("local:1", "127.0.0.1", 1)
+        dealer.connect.side_effect = primary
+        dealer.close.side_effect = cleanup
+        monitor.close.side_effect = cleanup
+
+        with pytest.raises(_ZmqLifecycleFailure) as raised:
+            transport.connect("peer:2")
+
+        assert raised.value is primary
+        assert transport._connections == {}
+        assert transport._deferred_sockets == [monitor, dealer]
+        monitor.close.side_effect = None
+        dealer.close.side_effect = None
+        transport.close()
+        assert transport._closed is True
+
+    def test_successful_open_ignores_logging_failure(self, monkeypatch):
+        router = MagicMock()
+        dealer = MagicMock()
+        monitor = MagicMock()
+        context = MagicMock()
+        context.socket.side_effect = [router, dealer, monitor]
+        monkeypatch.setattr(zmq_module.zmq, "Context", MagicMock(return_value=context))
+        monkeypatch.setattr(
+            zmq_module.logger,
+            "info",
+            MagicMock(side_effect=_ZmqLifecycleFailure("logging")),
+        )
+        transport = ZmqTransport("local:1", "127.0.0.1", 1)
+
+        connection = transport.connect("peer:2")
+
+        assert transport._connections == {"peer:2": connection}
+        transport.close()
+
+    def test_dead_connection_remains_owned_until_close_retry_succeeds(self):
+        transport = ZmqTransport.__new__(ZmqTransport)
+        transport._connections = {}
+        conn = _make_mock_connection("peer:2")
+        primary = _ZmqLifecycleFailure("monitor close")
+        conn._sockets.monitor.close.side_effect = [primary, None]
+        conn.mark_dead()
+        transport._connections[conn.peer_id] = conn
+
+        with pytest.raises(_ZmqLifecycleFailure) as raised:
+            transport._sweep_dead_connections()
+
+        assert raised.value is primary
+        assert transport._connections == {conn.peer_id: conn}
+        transport._sweep_dead_connections()
+        assert transport._connections == {}
+
+    def test_transport_close_attempts_every_resource_and_retries(self):
+        primary = _ZmqLifecycleFailure("connection close")
+        socket_error = _ZmqLifecycleFailure("deferred socket close")
+        context_error = _ZmqLifecycleFailure("context destroy")
+        failed_connection = MagicMock()
+        failed_connection.close.side_effect = [primary, None]
+        healthy_connection = MagicMock()
+        deferred = MagicMock()
+        deferred.close.side_effect = [socket_error, None]
+        router = MagicMock()
+        context = MagicMock()
+        context.closed = False
+        context.destroy.side_effect = [context_error, None]
+        transport = ZmqTransport.__new__(ZmqTransport)
+        transport._local_id = "local:1"
+        transport._closed = False
+        transport._connections = {
+            "failed:1": failed_connection,
+            "healthy:2": healthy_connection,
+        }
+        transport._deferred_sockets = [deferred]
+        transport._router = router
+        transport._zmq_ctx = context
+
+        with pytest.raises(_ZmqLifecycleFailure) as raised:
+            transport.close()
+
+        assert raised.value is primary
+        assert transport._connections == {"failed:1": failed_connection}
+        assert transport._deferred_sockets == [deferred]
+        assert transport._router is None
+        assert transport._zmq_ctx is context
+        assert transport._closed is False
+        healthy_connection.close.assert_called_once_with()
+        router.close.assert_called_once_with(linger=0)
+
+        transport.close()
+        assert transport._closed is True
+        assert transport._connections == {}
+        assert transport._deferred_sockets == []
+        assert context.destroy.call_count == 2
+        transport.close()
+        assert failed_connection.close.call_count == 2
+        assert healthy_connection.close.call_count == 1
+        assert deferred.close.call_count == 2
+        assert context.destroy.call_count == 2
 
 
 class TestZmqTransportConnectivity:
