@@ -208,6 +208,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         port: int | None = None,
         backends: list[str] | None = None,
         num_threads: int = 4,
+        transfer_api: str = "native",
         **kwargs: Any,
     ) -> None:
         """Initialize the P2P secondary tier manager.
@@ -245,6 +246,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             num_threads: NIXL agent worker threads for the UCX-only
                 branch. Ignored when ``backends`` contains a non-UCX
                 entry.
+            transfer_api: Experimental Core path ("torch") or default "native".
             **kwargs: Reserved for future tier-specific options.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
@@ -290,6 +292,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             config_fields=config_fields,
             backends=backends,
             num_threads=int(num_threads),
+            transfer_api=transfer_api,
         )
         self._control: ControlTransport = ZmqTransport(self._local_id, host, port)
 

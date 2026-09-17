@@ -199,6 +199,12 @@ Block content hashes must match across instances for peers to exchange blocks (s
 | `port` | no | `$VLLM_P2P_SIDE_CHANNEL_PORT` (`5710`) | Base port for the control socket. Must be reachable from peers. The bound port is `base + data_parallel_index` (one socket per DP replica). When omitted, the base resolves from the env var below. |
 | `backends` | no | `["UCX"]` | NIXL transport backends. See [NixlConnector Usage Guide](nixl_connector_usage.md#selecting-a-nixl-transport-backend-plugin) for available backends and selection guidance. |
 | `num_threads` | no | `4` | NIXL agent worker threads. Only used when `backends` is UCX-only; ignored when any non-UCX backend is requested. |
+| `transfer_api` | no | `"native"` | `"torch"` routes the existing P2P data plane through the experimental `torch.distributed._transfer` API and `nixl.torch_transfer` provider. |
+
+The `torch` mode is a success-path review prototype, requiring both prototype
+packages. It keeps the existing control protocol and native default. Active
+cancellation, failure recovery and GPU/end-to-end performance are not validated;
+do not deploy this mode in production. This does not change `NixlConnector`.
 
 The `backends` and `num_threads` options mirror the conditional logic used by [`NixlConnector`](nixl_connector_usage.md#selecting-a-nixl-transport-backend-plugin): when any non-UCX backend is configured, NIXL is initialised with `backends=...`; otherwise it falls back to a UCX-only agent with the configured `num_threads`. This lets the P2P tier use a different transport (e.g. `MOONCAKE`, `GDS_MT`, `LIBFABRIC`) than the main `NixlConnector` running in the same process.
 

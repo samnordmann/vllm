@@ -8,6 +8,7 @@ import ctypes
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 
 from vllm.v1.kv_offload.tiering.p2p.data.base import PollResult
 from vllm.v1.kv_offload.tiering.p2p.data.nixl import NixlTransport
@@ -102,6 +103,36 @@ class TestNixlTransportWithMockedAgent:
     def test_available_true_with_agent(self):
         transport = self._make_transport()
         assert transport.available is True
+
+    def test_torch_path_preserves_peer_scoped_completion(self):
+        pytest.importorskip("torch.distributed._transfer")
+        pytest.importorskip("nixl.torch_transfer")
+        native = MagicMock()
+        native.name = "local"
+        native.nixl_mems = {"DRAM": 0, "VRAM": 1}
+        native.add_remote_agent.side_effect = ["peer-a", "peer-b"]
+        native.get_xfer_descs.return_value.getType.return_value = 0
+        native.transfer.return_value = "PROC"
+        native.check_xfer_state.return_value = "PROC"
+        module = "vllm.v1.kv_offload.tiering.p2p.data.nixl"
+        with (
+            patch(f"{module}._NixlAgent", return_value=native),
+            patch(f"{module}._NixlAgentConfig"),
+        ):
+            transport = NixlTransport(
+                "local",
+                memoryview(np.zeros((4, 16), dtype=np.uint8)),
+                transfer_api="torch",
+            )
+        for peer in ("peer-a", "peer-b"):
+            transport.add_remote_peer(peer, b"metadata", 0x2000, 4, 16)
+        first = transport.write_blocks("peer-a", [0], [1])
+        second = transport.write_blocks("peer-b", [2], [3])
+        assert transport.poll() == PollResult(done=(), failed=())
+        native.check_xfer_state.return_value = "DONE"
+        assert transport.poll("peer-a").done == [first]
+        assert transport.poll("peer-b").done == [second]
+        transport.close()
 
     def test_get_agent_metadata(self):
         transport = self._make_transport()

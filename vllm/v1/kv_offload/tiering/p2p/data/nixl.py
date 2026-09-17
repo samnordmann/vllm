@@ -55,8 +55,12 @@ class NixlTransport(DataTransport):
         config_fields: dict | None = None,
         backends: list[str] | None = None,
         num_threads: int = 4,
+        transfer_api: str = "native",
     ) -> None:
         super().__init__(view, config_fields=config_fields)
+        if transfer_api not in ("native", "torch"):
+            raise ValueError("transfer_api must be native or torch")
+        self._transfer_api = transfer_api
         self._agent_name = agent_name
         self._backends = list(backends) if backends else ["UCX"]
         self._num_threads = num_threads
@@ -97,6 +101,10 @@ class NixlTransport(DataTransport):
                 self._num_threads,
             )
         self._agent = _NixlAgent(self._agent_name, cfg)
+        if self._transfer_api == "torch":
+            from nixl.torch_transfer import TorchTransferAgent
+
+            self._agent = TorchTransferAgent(self._agent, owner=view)
 
         total_size = self._num_blocks * self._block_len
         reg_descs = [(self._base_addr, total_size, 0, "")]
